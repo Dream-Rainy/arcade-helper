@@ -78,5 +78,3 @@ cd .\src\submodule\arcade-helper
 uv run --extra dev pytest
 uv build --out-dir dist
 ```
-
-不要提交 `.venv`、`dist`、`build`、`*.egg-info` 或缓存目录。

@@ -78,5 +78,3 @@ cd .\src\submodule\arcade-helper
 uv run --extra dev pytest
 uv build --out-dir dist
 ```
-
-Do not commit `.venv`, `dist`, `build`, `*.egg-info`, or cache directories.
