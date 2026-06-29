@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arcade-helper"
+version = "0.1.0"
+description = "Provider-oriented arcade game data helper package."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.10,<3",
+    "pypinyin>=0.53,<1",
+    "rapidfuzz>=3.10,<4",
+    "zhconv>=1.4,<2",
+]
+
+[project.optional-dependencies]
+storage-tortoise = [
+    "tortoise-orm[asyncmy,asyncpg]>=0.23,<1",
+]
+sse = [
+    "aiohttp>=3.11,<4",
+]
+dev = [
+    "aiohttp>=3.11,<4",
+    "pytest>=8,<9",
+    "pytest-asyncio>=1.3,<2",
+    "tortoise-orm[asyncmy,asyncpg]>=0.23,<1",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["arcade_helper*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]

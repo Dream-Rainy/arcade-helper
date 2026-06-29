@@ -1,0 +1,16 @@
+pydantic<3,>=2.10
+pypinyin<1,>=0.53
+rapidfuzz<4,>=3.10
+zhconv<2,>=1.4
+
+[dev]
+aiohttp<4,>=3.11
+pytest<9,>=8
+pytest-asyncio<2,>=1.3
+tortoise-orm[asyncmy,asyncpg]<1,>=0.23
+
+[sse]
+aiohttp<4,>=3.11
+
+[storage-tortoise]
+tortoise-orm[asyncmy,asyncpg]<1,>=0.23
