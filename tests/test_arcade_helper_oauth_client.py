@@ -69,6 +69,30 @@ async def test_oauth_client_keeps_explicit_redirect_uri_with_relay_url() -> None
 
 
 @pytest.mark.asyncio
+async def test_oauth_client_omits_empty_redirect_uri() -> None:
+    captured: dict[str, Any] = {}
+
+    async def post_json(url: str, **kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs["json_data"])
+        return {
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_in": 900,
+        }
+
+    client = OauthClient(
+        http_post_json=post_json,
+        client_id="client-id",
+        client_secret="client-secret",
+        redirect_uri="",
+    )
+
+    await client.get_token("auth-code")
+
+    assert "redirect_uri" not in captured
+
+
+@pytest.mark.asyncio
 async def test_oauth_client_reads_top_level_token_response() -> None:
     client = _oauth_client(
         {
