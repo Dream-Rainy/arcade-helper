@@ -1,113 +1,178 @@
-"""Maimai player domain handles and raw data wrappers."""
+"""Maimai player domain handles and LXNS response models."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+
 from arcade_helper.core.result import DataResult
 from arcade_helper.users import PlatformIdentity
 
 
-@dataclass(frozen=True)
-class MaimaiProfile:
-    """Raw maimai player profile result."""
+class _MaimaiModel(BaseModel):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
 
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
-
-
-@dataclass(frozen=True)
-class MaimaiBests:
-    """Raw maimai rating bests result."""
-
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
+    @property
+    def raw(self) -> dict[str, Any]:
+        """Backward-compatible raw-ish view of the parsed payload."""
+        return self.model_dump(mode="python", exclude_none=True)
 
 
-@dataclass(frozen=True)
-class MaimaiBest:
-    """Raw single maimai best score result."""
-
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
-
-
-@dataclass(frozen=True)
-class MaimaiApBests:
-    """Raw maimai AP/AP+ scores result."""
-
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
+class MaimaiCollectionRequiredSong(_MaimaiModel):
+    id: int | None = None
+    title: str | None = None
+    type: str | None = None
+    completed: bool | None = None
+    completed_difficulties: list[int] | None = None
 
 
-@dataclass(frozen=True)
-class MaimaiSongBests:
-    """Raw maimai song score list result."""
-
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
-
-
-@dataclass(frozen=True)
-class MaimaiRecents:
-    """Raw maimai recent plays result."""
-
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
+class MaimaiCollectionRequired(_MaimaiModel):
+    difficulties: list[int] | None = None
+    rate: str | None = None
+    fc: str | None = None
+    fs: str | None = None
+    songs: list[MaimaiCollectionRequiredSong] | None = None
+    completed: bool | None = None
 
 
-@dataclass(frozen=True)
-class MaimaiScores:
-    """Raw maimai full scores result."""
+class MaimaiCollection(_MaimaiModel):
+    """maimai Collection."""
 
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
-
-
-@dataclass(frozen=True)
-class MaimaiHeatmap:
-    """Raw maimai play heatmap result."""
-
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
+    id: int | None = Field(None, validation_alias=AliasChoices("id", "collection_id"))
+    name: str | None = None
+    color: str | None = None
+    description: str | None = None
+    genre: str | None = None
+    required: list[MaimaiCollectionRequired] | None = None
+    collection_type: str = ""
+    collection_id: int | None = None
 
 
-@dataclass(frozen=True)
-class MaimaiTrend:
-    """Raw maimai rating trend result."""
+class MaimaiProfile(_MaimaiModel):
+    """maimai Player."""
 
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
-
-
-@dataclass(frozen=True)
-class MaimaiScoreHistory:
-    """Raw maimai score history result."""
-
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
+    name: str | None = None
+    rating: int | None = None
+    friend_code: int | str | None = None
+    course_rank: int | None = None
+    class_rank: int | None = None
+    star: int | None = None
+    trophy: MaimaiCollection | None = None
+    icon: MaimaiCollection | None = None
+    name_plate: MaimaiCollection | None = None
+    frame: MaimaiCollection | None = None
+    upload_time: str | None = None
 
 
-@dataclass(frozen=True)
-class MaimaiCollection:
-    """Raw maimai player collection item result."""
+class MaimaiSimpleScore(_MaimaiModel):
+    """maimai SimpleScore."""
 
-    friend_code: str
-    collection_type: str
-    collection_id: int
-    raw: Any
-    provider: str = "lxns"
+    id: int | None = Field(None, validation_alias=AliasChoices("id", "song_id", "songId"))
+    song_name: str | None = Field(None, validation_alias=AliasChoices("song_name", "songName", "title"))
+    level: str | None = None
+    level_index: int | None = Field(None, validation_alias=AliasChoices("level_index", "levelIndex"))
+    fc: str | None = None
+    fs: str | None = None
+    rate: str | None = None
+    type: str | None = None
+
+
+class MaimaiScore(MaimaiSimpleScore):
+    """maimai Score."""
+
+    achievements: float | None = Field(None, validation_alias=AliasChoices("achievements", "achievement"))
+    dx_score: int | None = Field(None, validation_alias=AliasChoices("dx_score", "dxScore"))
+    dx_star: int | None = Field(None, validation_alias=AliasChoices("dx_star", "dxStar"))
+    dx_rating: float | None = Field(None, validation_alias=AliasChoices("dx_rating", "dxRating"))
+    play_time: str | None = Field(None, validation_alias=AliasChoices("play_time", "playTime", "playedAt"))
+    upload_time: str | None = Field(None, validation_alias=AliasChoices("upload_time", "uploadTime"))
+    last_played_time: str | None = Field(None, validation_alias=AliasChoices("last_played_time", "lastPlayedTime"))
+
+
+class MaimaiBest(MaimaiScore):
+    """Single maimai Score returned by the best endpoint."""
+
+
+class MaimaiBests(_MaimaiModel):
+    """maimai Best 50 payload."""
+
+    standard_total: int | None = None
+    dx_total: int | None = None
+    standard: list[MaimaiScore] = Field(default_factory=list)
+    dx: list[MaimaiScore] = Field(default_factory=list)
+    standard_selections: list[MaimaiScore] = Field(default_factory=list)
+    dx_selections: list[MaimaiScore] = Field(default_factory=list)
+
+
+class MaimaiApBests(MaimaiBests):
+    """maimai AP/AP+ best payload."""
+
+    scores: list[MaimaiScore] = Field(default_factory=list)
+
+
+class MaimaiSongBests(_MaimaiModel):
+    """maimai scores for one song."""
+
+    scores: list[MaimaiScore] = Field(default_factory=list)
+
+    @property
+    def raw(self) -> list[dict[str, Any]] | dict[str, Any]:
+        if self.scores:
+            return [score.raw for score in self.scores]
+        return super().raw
+
+
+class MaimaiRecents(MaimaiSongBests):
+    """maimai Recent 50 payload."""
+
+
+class MaimaiScores(_MaimaiModel):
+    """maimai SimpleScore list."""
+
+    scores: list[MaimaiSimpleScore] = Field(default_factory=list)
+
+    @property
+    def raw(self) -> list[dict[str, Any]] | dict[str, Any]:
+        if self.scores:
+            return [score.raw for score in self.scores]
+        return super().raw
+
+
+class MaimaiHeatmap(_MaimaiModel):
+    """maimai play heatmap payload."""
+
+    records: Any = None
+
+    @property
+    def raw(self) -> Any:
+        return self.records if self.records is not None else super().raw
+
+
+class MaimaiRatingTrend(_MaimaiModel):
+    """maimai RatingTrend."""
+
+    total: int | None = None
+    standard: int | None = None
+    dx: int | None = None
+    date: str | None = None
+
+
+class MaimaiTrend(_MaimaiModel):
+    """maimai rating trend payload."""
+
+    trend: list[MaimaiRatingTrend] = Field(default_factory=list)
+
+    @property
+    def raw(self) -> list[dict[str, Any]] | dict[str, Any]:
+        if self.trend:
+            return [item.raw for item in self.trend]
+        return super().raw
+
+
+class MaimaiScoreHistory(MaimaiSongBests):
+    """maimai score history payload."""
 
 
 @dataclass(frozen=True)
@@ -227,12 +292,17 @@ __all__ = [
     "MaimaiBest",
     "MaimaiBests",
     "MaimaiCollection",
+    "MaimaiCollectionRequired",
+    "MaimaiCollectionRequiredSong",
     "MaimaiHeatmap",
     "MaimaiPlayer",
     "MaimaiProfile",
+    "MaimaiRatingTrend",
     "MaimaiRecents",
+    "MaimaiScore",
     "MaimaiScoreHistory",
     "MaimaiScores",
+    "MaimaiSimpleScore",
     "MaimaiSongBests",
     "MaimaiTrend",
 ]

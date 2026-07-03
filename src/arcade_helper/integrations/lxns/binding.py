@@ -126,6 +126,31 @@ def _hash_api_key(raw: str) -> str:
     return sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _short_hash(raw: str) -> str:
+    return sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def build_provider_account_key(
+    *,
+    maimai_friend_code: str = "",
+    chunithm_friend_code: str = "",
+    fallback: str = "",
+) -> str:
+    """Build the provider-user key shared by multiple credentials."""
+
+    if maimai_friend_code:
+        return f"maimai:{maimai_friend_code}"
+    if chunithm_friend_code:
+        return f"chunithm:{chunithm_friend_code}"
+    if fallback:
+        return fallback
+    raise ValueError("provider account key needs a friend code or fallback")
+
+
+def build_oauth_fallback_account_key(refresh_token: str) -> str:
+    return f"oa:{_short_hash(refresh_token)}"
+
+
 def build_account_key(req: LxnsBindRequest) -> str:
     cred = req.credential
 
@@ -222,5 +247,7 @@ __all__ = [
     "bind_upsert",
     "build_account_json",
     "build_account_key",
+    "build_oauth_fallback_account_key",
+    "build_provider_account_key",
     "serialize_account_json",
 ]

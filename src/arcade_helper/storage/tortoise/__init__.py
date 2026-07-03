@@ -1,6 +1,7 @@
 """Tortoise ORM storage for external game and integration data."""
 
 from .account_store import TortoiseAccountStore
+from .migration import migrate_tortoise_account_store_v2
 from .models import (
     ChuniSong,
     ChuniSongAlias,
@@ -10,6 +11,8 @@ from .models import (
     MaiMapTreasure,
     MaiSong,
     MaiSongAlias,
+    ProviderAccount,
+    ProviderCredential,
     QQ_PLATFORM,
     User,
     UserAccount,
@@ -30,6 +33,8 @@ __all__ = [
     "MaiMapTreasure",
     "MaiSong",
     "MaiSongAlias",
+    "ProviderAccount",
+    "ProviderCredential",
     "QQ_PLATFORM",
     "TortoiseAccountStore",
     "TortoiseSongStore",
@@ -37,5 +42,6 @@ __all__ = [
     "UserAccount",
     "ensure_user_by_qq",
     "get_user_by_qq",
+    "migrate_tortoise_account_store_v2",
 ]
 

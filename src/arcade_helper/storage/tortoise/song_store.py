@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import traceback
 from dataclasses import dataclass
@@ -14,6 +15,9 @@ from arcade_helper.games.maimai.data_fetcher import build_maimai_jacket_image_na
 from arcade_helper.games.maimai.schemas import MaiSongData, MapData, MapTreasureData
 
 from .models import ChuniSong, ChuniSongAlias, MaiMap, MaiMapTreasure, MaiSong, MaiSongAlias
+
+
+_SYNC_BATCH_SIZE = 500
 
 
 @dataclass(frozen=True)
@@ -63,6 +67,21 @@ def _chunithm_song_from_row(row: Any, aliases: list[str]) -> ChuniSongData:
         "comment": "",
         "aliases": aliases,
     })
+
+
+def _chunks(items: list[Any], size: int):
+    for index in range(0, len(items), size):
+        yield items[index : index + size]
+
+
+async def _bulk_upsert(model: type, objects: list[Any], update_fields: list[str]) -> None:
+    for chunk in _chunks(objects, _SYNC_BATCH_SIZE):
+        await model.bulk_create(
+            chunk,
+            update_fields=update_fields,
+            on_conflict=["id"],
+        )
+        await asyncio.sleep(0)
 
 
 class TortoiseSongStore:
@@ -155,11 +174,27 @@ class TortoiseSongStore:
         synced_count = 0
         alias_count = 0
 
-        for song_id, song in song_data.items():
-            defaults = self._song_to_defaults(game_code, song)
-            db_song, _ = await spec.song_model.update_or_create(id=song_id, defaults=defaults)
-            synced_count += 1
+        song_rows = [
+            spec.song_model(id=song_id, **self._song_to_defaults(game_code, song))
+            for song_id, song in song_data.items()
+        ]
+        if song_rows:
+            update_fields = list(self._song_to_defaults(game_code, next(iter(song_data.values()))))
+            await _bulk_upsert(spec.song_model, song_rows, update_fields)
+            synced_count = len(song_rows)
 
+        song_ids = list(song_data)
+        existing_alias_rows = (
+            await spec.alias_model.filter(song_id__in=song_ids).values("song_id", "alias") if song_ids else []
+        )
+        existing_aliases = {
+            (int(row["song_id"]), str(row["alias"]).lower())
+            for row in existing_alias_rows
+            if row.get("song_id") is not None and row.get("alias")
+        }
+
+        alias_rows = []
+        for song_id, song in song_data.items():
             aliases_to_sync: list[str] = getattr(song, "aliases", None) or []
             seen: set[str] = set()
             unique_aliases: list[str] = []
@@ -168,22 +203,17 @@ class TortoiseSongStore:
                     seen.add(alias.lower())
                     unique_aliases.append(alias)
 
-            if unique_aliases:
-                existing_aliases = set(
-                    str(a).lower()
-                    for a in await spec.alias_model.filter(song_id=song_id).values_list(
-                        "alias",
-                        flat=True,
-                    )
-                )
-                for priority, alias in enumerate(unique_aliases):
-                    if alias.lower() not in existing_aliases:
-                        await spec.alias_model.create(
-                            song=db_song,
-                            alias=alias,
-                            priority=priority,
-                        )
-                        alias_count += 1
+            for priority, alias in enumerate(unique_aliases):
+                key = (song_id, alias.lower())
+                if key in existing_aliases:
+                    continue
+                alias_rows.append(spec.alias_model(song_id=song_id, alias=alias, priority=priority))
+                existing_aliases.add(key)
+
+        for chunk in _chunks(alias_rows, _SYNC_BATCH_SIZE):
+            await spec.alias_model.bulk_create(chunk, ignore_conflicts=True)
+            alias_count += len(chunk)
+            await asyncio.sleep(0)
 
         self.logger.info(f"[{game_code}] 乐曲数据同步完成：{synced_count} 首乐曲，新增 {alias_count} 条别名")
 
@@ -198,77 +228,107 @@ class TortoiseSongStore:
 
     async def sync_maimai_maps(self, map_data: dict[int, MapData]) -> None:
         self.logger.info(f"开始同步 maimai 地图数据到数据库，共 {len(map_data)} 个地图")
-        synced_count = 0
+        update_fields = [
+            "data_name",
+            "map_name",
+            "is_collabo",
+            "is_infinity",
+            "island_id",
+            "island_name",
+            "color_id",
+            "color_name",
+            "bonus_music_id",
+            "bonus_music_name",
+            "bonus_music_magnification",
+            "open_event_id",
+            "open_event_name",
+            "net_open_name_id",
+            "net_open_name",
+            "treasures",
+        ]
+        rows = [
+            MaiMap(
+                id=map_id,
+                data_name=map_model.data_name,
+                map_name=map_model.map_name,
+                is_collabo=map_model.is_collabo,
+                is_infinity=map_model.is_infinity,
+                island_id=map_model.island_id,
+                island_name=map_model.island_name,
+                color_id=map_model.color_id,
+                color_name=map_model.color_name,
+                bonus_music_id=map_model.bonus_music_id,
+                bonus_music_name=map_model.bonus_music_name,
+                bonus_music_magnification=map_model.bonus_music_magnification,
+                open_event_id=map_model.open_event_id,
+                open_event_name=map_model.open_event_name,
+                net_open_name_id=map_model.net_open_name_id,
+                net_open_name=map_model.net_open_name,
+                treasures=[t.model_dump(by_alias=True) for t in map_model.treasures],
+            )
+            for map_id, map_model in map_data.items()
+        ]
+        await _bulk_upsert(MaiMap, rows, update_fields)
 
-        for map_id, map_model in map_data.items():
-            try:
-                await MaiMap.update_or_create(
-                    id=map_id,
-                    defaults={
-                        "data_name": map_model.data_name,
-                        "map_name": map_model.map_name,
-                        "is_collabo": map_model.is_collabo,
-                        "is_infinity": map_model.is_infinity,
-                        "island_id": map_model.island_id,
-                        "island_name": map_model.island_name,
-                        "color_id": map_model.color_id,
-                        "color_name": map_model.color_name,
-                        "bonus_music_id": map_model.bonus_music_id,
-                        "bonus_music_name": map_model.bonus_music_name,
-                        "bonus_music_magnification": map_model.bonus_music_magnification,
-                        "open_event_id": map_model.open_event_id,
-                        "open_event_name": map_model.open_event_name,
-                        "net_open_name_id": map_model.net_open_name_id,
-                        "net_open_name": map_model.net_open_name,
-                        "treasures": [t.model_dump(by_alias=True) for t in map_model.treasures],
-                    },
-                )
-                synced_count += 1
-            except Exception as e:
-                self.logger.warning(f"同步地图 {map_id} 失败: {e}")
-                traceback.print_exc()
-
-        self.logger.info(f"maimai 地图数据同步完成：{synced_count} 个地图")
+        self.logger.info(f"maimai 地图数据同步完成：{len(rows)} 个地图")
 
     async def sync_maimai_map_treasures(self, treasure_data: dict[int, MapTreasureData]) -> None:
         self.logger.info(f"开始同步 maimai 地图奖励数据到数据库，共 {len(treasure_data)} 个奖励")
-        synced_count = 0
+        update_fields = [
+            "data_name",
+            "treasure_name",
+            "treasure_type",
+            "character_id",
+            "character_name",
+            "music_id",
+            "music_name",
+            "numeric",
+            "name_plate_id",
+            "name_plate_name",
+            "frame_id",
+            "frame_name",
+            "title_id",
+            "title_name",
+            "icon_id",
+            "icon_name",
+            "challenge_id",
+            "challenge_name",
+            "gate_id",
+            "gate_name",
+            "key_id",
+            "key_name",
+        ]
+        rows = [
+            MaiMapTreasure(
+                id=treasure_id,
+                data_name=treasure_model.data_name,
+                treasure_name=treasure_model.treasure_name,
+                treasure_type=treasure_model.treasure_type,
+                character_id=treasure_model.character_id,
+                character_name=treasure_model.character_name,
+                music_id=treasure_model.music_id,
+                music_name=treasure_model.music_name,
+                numeric=treasure_model.numeric,
+                name_plate_id=treasure_model.name_plate_id,
+                name_plate_name=treasure_model.name_plate_name,
+                frame_id=treasure_model.frame_id,
+                frame_name=treasure_model.frame_name,
+                title_id=treasure_model.title_id,
+                title_name=treasure_model.title_name,
+                icon_id=treasure_model.icon_id,
+                icon_name=treasure_model.icon_name,
+                challenge_id=treasure_model.challenge_id,
+                challenge_name=treasure_model.challenge_name,
+                gate_id=treasure_model.gate_id,
+                gate_name=treasure_model.gate_name,
+                key_id=treasure_model.key_id,
+                key_name=treasure_model.key_name,
+            )
+            for treasure_id, treasure_model in treasure_data.items()
+        ]
+        await _bulk_upsert(MaiMapTreasure, rows, update_fields)
 
-        for treasure_id, treasure_model in treasure_data.items():
-            try:
-                await MaiMapTreasure.update_or_create(
-                    id=treasure_id,
-                    defaults={
-                        "data_name": treasure_model.data_name,
-                        "treasure_name": treasure_model.treasure_name,
-                        "treasure_type": treasure_model.treasure_type,
-                        "character_id": treasure_model.character_id,
-                        "character_name": treasure_model.character_name,
-                        "music_id": treasure_model.music_id,
-                        "music_name": treasure_model.music_name,
-                        "numeric": treasure_model.numeric,
-                        "name_plate_id": treasure_model.name_plate_id,
-                        "name_plate_name": treasure_model.name_plate_name,
-                        "frame_id": treasure_model.frame_id,
-                        "frame_name": treasure_model.frame_name,
-                        "title_id": treasure_model.title_id,
-                        "title_name": treasure_model.title_name,
-                        "icon_id": treasure_model.icon_id,
-                        "icon_name": treasure_model.icon_name,
-                        "challenge_id": treasure_model.challenge_id,
-                        "challenge_name": treasure_model.challenge_name,
-                        "gate_id": treasure_model.gate_id,
-                        "gate_name": treasure_model.gate_name,
-                        "key_id": treasure_model.key_id,
-                        "key_name": treasure_model.key_name,
-                    },
-                )
-                synced_count += 1
-            except Exception as e:
-                self.logger.warning(f"同步奖励 {treasure_id} 失败: {e}")
-                traceback.print_exc()
-
-        self.logger.info(f"maimai 地图奖励数据同步完成：{synced_count} 个奖励")
+        self.logger.info(f"maimai 地图奖励数据同步完成：{len(rows)} 个奖励")
 
     async def get_song_by_id(self, game_code: str, song_id: int) -> SongData | None:
         spec = self._spec(game_code)

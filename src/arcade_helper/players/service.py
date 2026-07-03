@@ -21,9 +21,12 @@ from .chunithm import (
     ChunithmHeatmap,
     ChunithmPlayer,
     ChunithmProfile,
+    ChunithmRatingTrend,
     ChunithmRecents,
+    ChunithmScore,
     ChunithmScoreHistory,
     ChunithmScores,
+    ChunithmSimpleScore,
     ChunithmSongBests,
     ChunithmTrend,
 )
@@ -35,9 +38,12 @@ from .maimai import (
     MaimaiHeatmap,
     MaimaiPlayer,
     MaimaiProfile,
+    MaimaiRatingTrend,
     MaimaiRecents,
+    MaimaiScore,
     MaimaiScoreHistory,
     MaimaiScores,
+    MaimaiSimpleScore,
     MaimaiSongBests,
     MaimaiTrend,
 )
@@ -123,7 +129,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            MaimaiProfile(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_model(MaimaiProfile, response.data),
             operation="maimai.player.profile.by_friend_code",
             provider=response.provider,
         )
@@ -141,7 +147,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            MaimaiBests(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_model(MaimaiBests, response.data),
             operation="maimai.player.bests",
             provider=response.provider,
         )
@@ -164,9 +170,9 @@ class PlayerService:
         )
         if response is not None:
             return self._result(
-                MaimaiBest(
-                    friend_code=player.friend_code,
-                    raw=_best_score_from_response(
+                _parse_model(
+                    MaimaiBest,
+                    _best_score_from_response(
                         response.data,
                         song_id=song_id,
                         song_name=song_name,
@@ -174,7 +180,6 @@ class PlayerService:
                         song_type=song_type,
                         score_fields=("achievements", "achievement", "dx_score", "dxScore", "score", "rating", "ra"),
                     ),
-                    provider=response.provider,
                 ),
                 operation="maimai.player.best",
                 provider=response.provider,
@@ -193,7 +198,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            MaimaiBest(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_model(MaimaiBest, response.data),
             operation="maimai.player.best",
             provider=response.provider,
         )
@@ -212,7 +217,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            ChunithmProfile(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_model(ChunithmProfile, response.data),
             operation="chunithm.player.profile.by_friend_code",
             provider=response.provider,
         )
@@ -231,7 +236,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            ChunithmBests(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_model(ChunithmBests, response.data),
             operation="chunithm.player.bests",
             provider=response.provider,
         )
@@ -253,9 +258,9 @@ class PlayerService:
         )
         if response is not None:
             return self._result(
-                ChunithmBest(
-                    friend_code=player.friend_code,
-                    raw=_best_score_from_response(
+                _parse_model(
+                    ChunithmBest,
+                    _best_score_from_response(
                         response.data,
                         song_id=song_id,
                         song_name=song_name,
@@ -263,7 +268,6 @@ class PlayerService:
                         song_type=None,
                         score_fields=("score", "rating", "ra"),
                     ),
-                    provider=response.provider,
                 ),
                 operation="chunithm.player.best",
                 provider=response.provider,
@@ -278,7 +282,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            ChunithmBest(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_model(ChunithmBest, response.data),
             operation="chunithm.player.best",
             provider=response.provider,
         )
@@ -307,7 +311,7 @@ class PlayerService:
             )
             if song_scores:
                 return self._result(
-                    ChunithmSongBests(friend_code=player.friend_code, raw=song_scores, provider=response.provider),
+                    _parse_list_model(ChunithmSongBests, ChunithmScore, song_scores, field="scores"),
                     operation="chunithm.player.song_bests",
                     provider=response.provider,
                 )
@@ -321,7 +325,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            ChunithmSongBests(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_list_model(ChunithmSongBests, ChunithmScore, response.data, field="scores"),
             operation="chunithm.player.song_bests",
             provider=response.provider,
         )
@@ -339,7 +343,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            ChunithmRecents(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_list_model(ChunithmRecents, ChunithmScore, response.data, field="scores"),
             operation="chunithm.player.recents",
             provider=response.provider,
             stale=response.stale,
@@ -359,7 +363,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            ChunithmScores(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_list_model(ChunithmScores, ChunithmSimpleScore, response.data, field="scores"),
             operation="chunithm.player.scores",
             provider=response.provider,
         )
@@ -378,7 +382,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            ChunithmHeatmap(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_records_model(ChunithmHeatmap, response.data),
             operation="chunithm.player.heatmap",
             provider=response.provider,
         )
@@ -399,7 +403,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            ChunithmTrend(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_list_model(ChunithmTrend, ChunithmRatingTrend, response.data, field="trend"),
             operation="chunithm.player.trend",
             provider=response.provider,
         )
@@ -421,7 +425,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            ChunithmScoreHistory(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_list_model(ChunithmScoreHistory, ChunithmScore, response.data, field="scores"),
             operation="chunithm.player.score_history",
             provider=response.provider,
         )
@@ -443,12 +447,11 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            ChunithmCollection(
-                friend_code=player.friend_code,
+            _parse_model(
+                ChunithmCollection,
+                response.data,
                 collection_type=collection_type,
                 collection_id=collection_id,
-                raw=response.data,
-                provider=response.provider,
             ),
             operation="chunithm.player.collection",
             provider=response.provider,
@@ -470,7 +473,7 @@ class PlayerService:
             ap_scores = _maimai_ap_scores_from_response(response.data)
             if ap_scores:
                 return self._result(
-                    MaimaiApBests(friend_code=player.friend_code, raw=ap_scores, provider=response.provider),
+                    _parse_list_model(MaimaiApBests, MaimaiScore, ap_scores, field="scores"),
                     operation="maimai.player.ap_bests",
                     provider=response.provider,
                 )
@@ -482,7 +485,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            MaimaiApBests(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_model(MaimaiApBests, response.data),
             operation="maimai.player.ap_bests",
             provider=response.provider,
         )
@@ -512,7 +515,7 @@ class PlayerService:
             )
             if song_scores:
                 return self._result(
-                    MaimaiSongBests(friend_code=player.friend_code, raw=song_scores, provider=response.provider),
+                    _parse_list_model(MaimaiSongBests, MaimaiScore, song_scores, field="scores"),
                     operation="maimai.player.song_bests",
                     provider=response.provider,
                 )
@@ -525,7 +528,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            MaimaiSongBests(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_list_model(MaimaiSongBests, MaimaiScore, response.data, field="scores"),
             operation="maimai.player.song_bests",
             provider=response.provider,
         )
@@ -543,7 +546,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            MaimaiRecents(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_list_model(MaimaiRecents, MaimaiScore, response.data, field="scores"),
             operation="maimai.player.recents",
             provider=response.provider,
             stale=response.stale,
@@ -562,7 +565,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            MaimaiScores(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_list_model(MaimaiScores, MaimaiSimpleScore, response.data, field="scores"),
             operation="maimai.player.scores",
             provider=response.provider,
         )
@@ -580,7 +583,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            MaimaiHeatmap(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_records_model(MaimaiHeatmap, response.data),
             operation="maimai.player.heatmap",
             provider=response.provider,
         )
@@ -600,7 +603,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            MaimaiTrend(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_list_model(MaimaiTrend, MaimaiRatingTrend, response.data, field="trend"),
             operation="maimai.player.trend",
             provider=response.provider,
         )
@@ -622,7 +625,7 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            MaimaiScoreHistory(friend_code=player.friend_code, raw=response.data, provider=response.provider),
+            _parse_list_model(MaimaiScoreHistory, MaimaiScore, response.data, field="scores"),
             operation="maimai.player.score_history",
             provider=response.provider,
         )
@@ -643,12 +646,11 @@ class PlayerService:
             headers=headers,
         )
         return self._result(
-            MaimaiCollection(
-                friend_code=player.friend_code,
+            _parse_model(
+                MaimaiCollection,
+                response.data,
                 collection_type=collection_type,
                 collection_id=collection_id,
-                raw=response.data,
-                provider=response.provider,
             ),
             operation="maimai.player.collection",
             provider=response.provider,
@@ -807,6 +809,46 @@ def _oauth_player_endpoint(game_code: str, endpoint: str) -> str | None:
         return f"/api/v0/user/{game_code}/player{suffix}"
     if suffix == "/{collection_type}/{collection_id}":
         return f"/api/v0/user/{game_code}/player/{'{collection_type}'}/{'{collection_id}'}"
+    return None
+
+
+def _response_payload(raw: Any) -> Any:
+    if isinstance(raw, dict) and "data" in raw and (len(raw) == 1 or "success" in raw or "code" in raw):
+        return raw["data"]
+    return raw
+
+
+def _parse_model(model: Any, raw: Any, **updates: Any):
+    payload = _response_payload(raw)
+    parsed = model.model_validate({} if payload is None else payload)
+    return parsed.model_copy(update=updates) if updates else parsed
+
+
+def _parse_list_model(model: Any, item_model: Any, raw: Any, *, field: str):
+    payload = _response_payload(raw)
+    items = _payload_list(payload, field)
+    if items is None:
+        return model.model_validate({} if payload is None else payload)
+    return model.model_validate({field: [item_model.model_validate(item) for item in items]})
+
+
+def _parse_records_model(model: Any, raw: Any):
+    payload = _response_payload(raw)
+    if isinstance(payload, dict):
+        return model.model_validate(payload)
+    return model.model_validate({"records": payload})
+
+
+def _payload_list(payload: Any, field: str) -> list[Any] | None:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        items = payload.get(field)
+        if isinstance(items, list):
+            return items
+        scores = payload.get("scores")
+        if isinstance(scores, list):
+            return scores
     return None
 
 

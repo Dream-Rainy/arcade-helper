@@ -66,6 +66,29 @@ async def test_json_account_store_binds_defaults_and_updates_token(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_json_account_store_game_profiles_are_provider_scoped(tmp_path):
+    store = JsonAccountStore(tmp_path / "accounts.json")
+    for provider, name in [("lxns", "LXNS"), ("other", "Other")]:
+        await store.upsert_provider_account(
+            identity_platform="qq",
+            identity_account_key="10001",
+            provider=provider,
+            account_key="same",
+            account_name=name,
+            account_json={"provider": provider},
+        )
+        await store.upsert_game_profile(provider=provider, account_key="same", maimai_name=name)
+
+    lxns = await store.get_game_profile_by_provider_account(provider="lxns", account_key="same")
+    other = await store.get_game_profile_by_provider_account(provider="other", account_key="same")
+
+    assert lxns is not None
+    assert other is not None
+    assert lxns.maimai_name == "LXNS"
+    assert other.maimai_name == "Other"
+
+
+@pytest.mark.asyncio
 async def test_json_account_store_dump_excludes_game_profiles(tmp_path):
     store = JsonAccountStore(tmp_path / "accounts.json")
     await store.upsert_provider_account(
@@ -81,7 +104,9 @@ async def test_json_account_store_dump_excludes_game_profiles(tmp_path):
     dump = await store.export_account_dump()
 
     assert len(dump.users) == 1
-    assert {account.platform for account in dump.accounts} == {"qq", "lxns"}
+    assert {account.platform for account in dump.accounts} == {"qq"}
+    assert {account.platform for account in dump.provider_accounts} == {"lxns"}
+    assert {credential.credential_method for credential in dump.provider_credentials} == {"oa"}
     assert "game_profiles" not in dump.to_json()
 
 

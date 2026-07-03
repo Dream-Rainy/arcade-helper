@@ -49,13 +49,69 @@ class UserAccount(Model):
         )
 
 
-class GameProfile(Model):
-    """游戏侧资料单独存表，并与某个 UserAccount 绑定。"""
+class ProviderAccount(Model):
+    """External provider account owned by one canonical user."""
 
     id = fields.IntField(primary_key=True)
 
-    account: fields.OneToOneRelation[UserAccount] = fields.OneToOneField(
-        "models.UserAccount",
+    user: fields.ForeignKeyRelation[User] = fields.ForeignKeyField(
+        "models.User",
+        related_name="provider_accounts",
+        on_delete=fields.CASCADE,
+        db_index=True,
+    )
+
+    provider = fields.CharField(max_length=32, db_index=True)
+    account_key = fields.CharField(max_length=128)
+    account_name = fields.CharField(max_length=64, null=True, default="Provider Account")
+    is_default = fields.BooleanField(default=False, db_index=True)
+    schema_version = fields.IntField(default=1)
+    account_json = fields.JSONField(default=dict)
+
+    class Meta(Model.Meta):
+        table = "provider_accounts"
+        unique_together = (("provider", "account_key"),)
+        indexes = (
+            ("user_id", "provider"),
+            ("user_id", "provider", "is_default"),
+            ("provider", "account_key"),
+        )
+
+
+class ProviderCredential(Model):
+    """One binding or access method for a provider account."""
+
+    id = fields.IntField(primary_key=True)
+
+    account: fields.ForeignKeyRelation[ProviderAccount] = fields.ForeignKeyField(
+        "models.ProviderAccount",
+        related_name="credentials",
+        on_delete=fields.CASCADE,
+        db_index=True,
+    )
+
+    credential_key = fields.CharField(max_length=128)
+    credential_method = fields.CharField(max_length=32, db_index=True)
+    credential_json = fields.JSONField(default=dict)
+    is_default = fields.BooleanField(default=False, db_index=True)
+    schema_version = fields.IntField(default=1)
+
+    class Meta(Model.Meta):
+        table = "provider_credentials"
+        unique_together = (("account_id", "credential_key"),)
+        indexes = (
+            ("account_id", "credential_method"),
+            ("account_id", "credential_method", "is_default"),
+        )
+
+
+class GameProfile(Model):
+    """游戏侧资料单独存表，并与某个 ProviderAccount 绑定。"""
+
+    id = fields.IntField(primary_key=True)
+
+    account: fields.OneToOneRelation[ProviderAccount] = fields.OneToOneField(
+        "models.ProviderAccount",
         related_name="game_profile",
         on_delete=fields.CASCADE,
         db_index=True,
@@ -251,6 +307,8 @@ __all__ = [
     "MaiMapTreasure",
     "MaiSong",
     "MaiSongAlias",
+    "ProviderAccount",
+    "ProviderCredential",
     "QQ_PLATFORM",
     "User",
     "UserAccount",

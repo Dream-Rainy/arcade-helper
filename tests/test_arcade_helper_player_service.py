@@ -192,7 +192,7 @@ async def test_maimai_player_methods_call_provider_api_and_return_freshness() ->
 
     assert profile.data.raw["endpoint"] == "/api/v0/maimai/player/{friend_code}"
     assert bests.freshness.operation == "maimai.player.bests"
-    assert recents.data.provider == "lxns"
+    assert recents.freshness.provider == "lxns"
     assert trend.freshness.stale is False
     assert [
         (call.method, call.endpoint, call.kwargs["path_params"], call.kwargs["headers"])
@@ -230,7 +230,7 @@ async def test_maimai_player_extra_methods_call_provider_api_with_params() -> No
     collection = await player.collection("frame", 456, headers={"X-Test": "1"})
 
     assert best.freshness.operation == "maimai.player.best"
-    assert ap_bests.data.provider == "lxns"
+    assert ap_bests.freshness.provider == "lxns"
     assert song_bests.data.raw["endpoint"] == "/api/v0/maimai/player/{friend_code}/bests"
     assert scores.freshness.stale is False
     assert heatmap.freshness.operation == "maimai.player.heatmap"
@@ -333,7 +333,7 @@ async def test_maimai_player_prefers_oauth_user_api_when_token_exists() -> None:
     collection = await player.collection("frame", 456, headers={"X-Test": "1"})
 
     assert bests.freshness.operation == "maimai.player.song_bests"
-    assert trend.data.provider == "lxns"
+    assert trend.freshness.provider == "lxns"
     assert collection.data.collection_id == 456
     assert [
         (
@@ -410,13 +410,11 @@ async def test_maimai_best_prefers_oauth_scores_and_filters_locally() -> None:
 
     best = await player.best(song_id=123, level_index="4", song_type="dx", headers={"X-Test": "1"})
 
-    assert best.data.raw == {
-        "song_id": 123,
-        "title": "Test Song",
-        "level_index": 4,
-        "type": "dx",
-        "achievements": 100.1,
-    }
+    assert best.data.id == 123
+    assert best.data.song_name == "Test Song"
+    assert best.data.level_index == 4
+    assert best.data.type == "dx"
+    assert best.data.achievements == 100.1
     assert [
         (
             call.endpoint,
@@ -471,9 +469,9 @@ async def test_maimai_song_bests_prefers_oauth_scores_and_filters_locally() -> N
 
     song_bests = await player.song_bests(song_id=123, song_type="dx", headers={"X-Test": "1"})
 
-    assert song_bests.data.raw == [
-        {"song_id": 123, "title": "Test Song", "type": "dx", "achievements": 100.2},
-        {"song_id": 123, "title": "Test Song", "type": "dx", "achievements": 99.9},
+    assert [(score.id, score.song_name, score.type, score.achievements) for score in song_bests.data.scores] == [
+        (123, "Test Song", "dx", 100.2),
+        (123, "Test Song", "dx", 99.9),
     ]
     assert [call.endpoint for call in provider.calls] == ["/api/v0/user/maimai/player/scores"]
 
@@ -511,9 +509,9 @@ async def test_maimai_ap_bests_prefers_oauth_scores_and_filters_locally() -> Non
 
     ap_bests = await player.ap_bests(headers={"X-Test": "1"})
 
-    assert ap_bests.data.raw == [
-        {"song_id": 3, "fc": "app", "achievements": 100.9},
-        {"song_id": 2, "fc": "ap", "achievements": 100.5},
+    assert [(score.id, score.fc, score.achievements) for score in ap_bests.data.scores] == [
+        (3, "app", 100.9),
+        (2, "ap", 100.5),
     ]
     assert [call.endpoint for call in provider.calls] == ["/api/v0/user/maimai/player/scores"]
 
@@ -590,9 +588,9 @@ async def test_maimai_recents_falls_back_to_oauth_scores_with_warning() -> None:
         recents = await player.recents(headers={"X-Test": "1"})
 
     assert recents.freshness.stale is True
-    assert recents.data.raw == [
-        {"song_id": 2, "playedAt": "2026-01-02T10:00:00Z"},
-        {"song_id": 1, "playedAt": "2026-01-01T10:00:00Z"},
+    assert [(score.id, score.play_time) for score in recents.data.scores] == [
+        (2, "2026-01-02T10:00:00Z"),
+        (1, "2026-01-01T10:00:00Z"),
     ]
     assert [call.endpoint for call in provider.calls] == [
         "/api/v0/maimai/player/{friend_code}/recents",
@@ -761,7 +759,10 @@ async def test_chunithm_best_prefers_oauth_scores_and_filters_locally() -> None:
 
     best = await player.best(song_id=55, level_index=3, headers={"X-Test": "1"})
 
-    assert best.data.raw == {"song": {"id": 55, "title": "Test Song"}, "levelIndex": 3, "score": 1009000}
+    assert best.data.id == 55
+    assert best.data.song_name == "Test Song"
+    assert best.data.level_index == 3
+    assert best.data.score == 1009000
     assert [
         (
             call.endpoint,
@@ -817,8 +818,8 @@ async def test_chunithm_song_bests_prefers_oauth_scores_and_filters_locally() ->
 
     song_bests = await player.song_bests(song_id=55, headers={"X-Test": "1"})
 
-    assert song_bests.data.raw == [
-        {"song": {"id": 55, "title": "Test Song"}, "levelIndex": 3, "score": 1009000},
-        {"song": {"id": 55, "title": "Test Song"}, "levelIndex": 2, "score": 1007000},
+    assert [(score.id, score.song_name, score.level_index, score.score) for score in song_bests.data.scores] == [
+        (55, "Test Song", 3, 1009000),
+        (55, "Test Song", 2, 1007000),
     ]
     assert [call.endpoint for call in provider.calls] == ["/api/v0/user/chunithm/player/scores"]

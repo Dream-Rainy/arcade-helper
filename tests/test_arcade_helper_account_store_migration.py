@@ -25,15 +25,21 @@ async def test_migrate_account_store_json_to_json(tmp_path):
 
     preview = await migrate_account_store(source=source, target=target, dry_run=True)
     assert preview.import_result.dry_run is True
-    assert preview.import_result.accounts_created == 2
+    assert preview.import_result.accounts_created == 3
 
     result = await migrate_account_store(source=source, target=target)
     assert len(result.dump.users) == 1
-    assert result.import_result.accounts_created == 2
+    assert result.import_result.accounts_created == 3
 
     migrated = await target.get_provider_account(provider="lxns", account_key="oauth:abc")
     assert migrated is not None
-    assert migrated.account_json["oauth2_refresh_token"] == "refresh"
+    credential = await target.get_provider_credential(
+        provider="lxns",
+        provider_account_key="oauth:abc",
+        credential_method="oa",
+    )
+    assert credential is not None
+    assert credential.credential_json["oauth2_refresh_token"] == "refresh"
 
     profile = await target.get_game_profile_by_provider_account(provider="lxns", account_key="oauth:abc")
     assert profile is not None

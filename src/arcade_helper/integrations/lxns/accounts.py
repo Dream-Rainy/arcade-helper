@@ -28,6 +28,7 @@ class StoredGameProfile:
     maimai_friend_code: str = ""
     chunithm_name: str = ""
     chunithm_friend_code: str = ""
+    provider: str = "lxns"
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,20 @@ class StoredProviderAccount:
     account_key: str
     account_name: str
     account_json: dict[str, Any]
+    schema_version: int = 1
+    is_default: bool = False
+
+
+@dataclass(frozen=True)
+class StoredProviderCredential:
+    """One access method for a provider account, such as OAuth or friend code."""
+
+    user_id: int
+    provider: str
+    provider_account_key: str
+    credential_key: str
+    credential_method: str
+    credential_json: dict[str, Any]
     schema_version: int = 1
     is_default: bool = False
 
@@ -83,6 +98,39 @@ class AccountStore(Protocol):
         account_name: str,
     ) -> StoredProviderAccount:
         """Create or update a provider account linked to a platform identity."""
+
+    async def upsert_provider_credential(
+        self,
+        *,
+        provider: str,
+        provider_account_key: str,
+        credential_key: str,
+        credential_method: str,
+        credential_json: dict[str, Any],
+        is_default: bool = True,
+    ) -> StoredProviderCredential:
+        """Create or update one credential attached to a provider account."""
+
+    async def get_provider_credential(
+        self,
+        *,
+        provider: str,
+        provider_account_key: str,
+        credential_method: str | None = None,
+        credential_key: str | None = None,
+    ) -> StoredProviderCredential | None:
+        """Return one credential for a provider account."""
+
+    async def update_provider_credential_json_if_current(
+        self,
+        *,
+        provider: str,
+        provider_account_key: str,
+        credential_key: str,
+        credential_json: dict[str, Any],
+        expected_refresh_token: str | None = None,
+    ) -> bool:
+        """Update credential JSON if the stored refresh token still matches."""
 
     async def upsert_lxns_account(
         self,
@@ -151,6 +199,7 @@ class AccountStore(Protocol):
     async def upsert_game_profile(
         self,
         *,
+        provider: str = "lxns",
         account_key: str,
         maimai_name: str | None = None,
         maimai_friend_code: str | None = None,
@@ -190,4 +239,10 @@ class AccountStore(Protocol):
         """Update provider account JSON if the stored refresh token still matches."""
 
 
-__all__ = ["AccountStore", "StoredGameProfile", "StoredLxnsAccount", "StoredProviderAccount"]
+__all__ = [
+    "AccountStore",
+    "StoredGameProfile",
+    "StoredLxnsAccount",
+    "StoredProviderAccount",
+    "StoredProviderCredential",
+]

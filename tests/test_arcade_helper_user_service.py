@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from arcade_helper.integrations.lxns.accounts import StoredGameProfile, StoredProviderAccount
+from arcade_helper.integrations.lxns.accounts import StoredGameProfile, StoredProviderAccount, StoredProviderCredential
 from arcade_helper.users import PlatformIdentity
 from arcade_helper.users.service import UserService
 
@@ -25,6 +25,7 @@ class FakeAccountStore:
     def __init__(self) -> None:
         self.users: dict[tuple[str, str], int] = {}
         self.accounts: dict[tuple[str, str], StoredProviderAccount] = {}
+        self.credentials: dict[tuple[str, str, str], StoredProviderCredential] = {}
         self.profiles: dict[tuple[str, str], StoredGameProfile] = {}
         self.next_user_id = 1
 
@@ -91,6 +92,47 @@ class FakeAccountStore:
         self.accounts[(provider, account_key)] = stored
         return stored
 
+    async def upsert_provider_credential(
+        self,
+        *,
+        provider: str,
+        provider_account_key: str,
+        credential_key: str,
+        credential_method: str,
+        credential_json: dict[str, Any],
+        is_default: bool = True,
+    ) -> StoredProviderCredential:
+        account = self.accounts[(provider, provider_account_key)]
+        credential = StoredProviderCredential(
+            user_id=account.user_id,
+            provider=provider,
+            provider_account_key=provider_account_key,
+            credential_key=credential_key,
+            credential_method=credential_method,
+            credential_json=credential_json,
+            is_default=is_default,
+        )
+        self.credentials[(provider, provider_account_key, credential_key)] = credential
+        return credential
+
+    async def get_provider_credential(
+        self,
+        *,
+        provider: str,
+        provider_account_key: str,
+        credential_method: str | None = None,
+        credential_key: str | None = None,
+    ) -> StoredProviderCredential | None:
+        credentials = [
+            credential
+            for (stored_provider, stored_account_key, stored_credential_key), credential in self.credentials.items()
+            if stored_provider == provider
+            and stored_account_key == provider_account_key
+            and (credential_key is None or stored_credential_key == credential_key)
+            and (credential_method is None or credential.credential_method == credential_method)
+        ]
+        return next((credential for credential in credentials if credential.is_default), credentials[0] if credentials else None)
+
     async def has_provider_account(
         self,
         *,
@@ -150,6 +192,7 @@ class FakeAccountStore:
         profile = StoredGameProfile(
             account_key=account_key,
             account_name=account.account_name,
+            provider=account.platform,
             maimai_name=kwargs.get("maimai_name") or "",
             maimai_friend_code=kwargs.get("maimai_friend_code") or "",
             chunithm_name=kwargs.get("chunithm_name") or "",
@@ -181,12 +224,18 @@ class FakeAccountStore:
         for account in accounts:
             self.accounts.pop((provider, account.account_key), None)
             self.profiles.pop((provider, account.account_key), None)
+            for key in list(self.credentials):
+                if key[0] == provider and key[1] == account.account_key:
+                    self.credentials.pop(key, None)
         return len(accounts)
 
     async def get_provider_account(self, *, provider: str, account_key: str) -> StoredProviderAccount | None:
         return self.accounts.get((provider, account_key))
 
     async def update_provider_account_json_if_current(self, **kwargs: Any) -> bool:
+        return True
+
+    async def update_provider_credential_json_if_current(self, **kwargs: Any) -> bool:
         return True
 
 
@@ -201,7 +250,7 @@ async def test_user_service_binds_and_lists_lxns_account():
     )
 
     assert result.status == "bound"
-    assert result.lxns_account_key == "unique_code:1234567890"
+    assert result.lxns_account_key == "maimai:1234567890"
 
     accounts = await service.list_lxns_accounts(PlatformIdentity.qq("10001"))
     assert len(accounts) == 1
@@ -234,3 +283,27 @@ async def test_user_service_resolves_canonical_user_and_platform_account_key():
 
     assert user == {"id": 1}
     assert account_key == "10003"
+
+
+@pytest.mark.asyncio
+async def test_user_service_oauth_credential_merges_with_friend_code_account():
+    store = FakeAccountStore()
+    service = UserService(store=store, lxns_client=FakeLxns())
+
+    first = await service.bind_lxns_by_friend_code(
+        identity=PlatformIdentity.qq("10004"),
+        friend_code="1234567890",
+    )
+    second = await service.bind_lxns_oauth_tokens(
+        identity=PlatformIdentity.qq("10004"),
+        token_data={
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "token_expiry": "2099-01-01T00:00:00+00:00",
+        },
+        maimai_friend_code="1234567890",
+    )
+
+    assert first.lxns_account_key == second.lxns_account_key
+    assert len(store.accounts) == 1
+    assert store.credentials[("lxns", "maimai:1234567890", "oa:oauth")].credential_method == "oa"

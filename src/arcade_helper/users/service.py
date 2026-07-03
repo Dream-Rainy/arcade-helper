@@ -17,6 +17,8 @@ from arcade_helper.integrations.lxns.binding import (
     LxnsProvider,
     LxnsUniqueCodeCredential,
     build_account_key,
+    build_oauth_fallback_account_key,
+    build_provider_account_key,
     serialize_account_json,
 )
 
@@ -115,15 +117,26 @@ class UserService:
             qq=identity.account_key,
             credential=LxnsUniqueCodeCredential(unique_code=friend_code),
         )
+        credential_key = build_account_key(req)
+        provider_account_key = build_provider_account_key(maimai_friend_code=friend_code)
         stored = await self._store.upsert_provider_account(
             identity_platform=identity.platform,
             identity_account_key=identity.account_key,
             provider=LXNS_PLATFORM,
-            account_key=build_account_key(req),
-            account_json=serialize_account_json(req),
+            account_key=provider_account_key,
+            account_json={"provider": LXNS_PLATFORM, "maimai_friend_code": friend_code},
             account_name=account_name or f"lxns_user_{identity.account_key}",
         )
+        await self._store.upsert_provider_credential(
+            provider=LXNS_PLATFORM,
+            provider_account_key=stored.account_key,
+            credential_key=credential_key,
+            credential_method=req.credential.method.value,
+            credential_json=serialize_account_json(req),
+            is_default=True,
+        )
         await self._store.upsert_game_profile(
+            provider=LXNS_PLATFORM,
             account_key=stored.account_key,
             maimai_friend_code=friend_code,
         )
@@ -279,6 +292,7 @@ class UserService:
             account_name=player_name or None,
         )
         await self._store.upsert_game_profile(
+            provider=LXNS_PLATFORM,
             account_key=result.lxns_account_key,
             maimai_name=player_name,
             maimai_friend_code=friend_code,
@@ -310,15 +324,33 @@ class UserService:
             refresh_expiry=token_data.get("refresh_expiry"),
         )
         req = LxnsBindRequest(qq=identity.account_key, credential=credential)
+        provider_account_key = build_provider_account_key(
+            maimai_friend_code=maimai_friend_code,
+            chunithm_friend_code=chunithm_friend_code,
+            fallback=build_oauth_fallback_account_key(str(token_data["refresh_token"])),
+        )
         stored = await self._store.upsert_provider_account(
             identity_platform=identity.platform,
             identity_account_key=identity.account_key,
             provider=LXNS_PLATFORM,
-            account_key=build_account_key(req),
-            account_json=serialize_account_json(req),
+            account_key=provider_account_key,
+            account_json={
+                "provider": LXNS_PLATFORM,
+                "maimai_friend_code": maimai_friend_code,
+                "chunithm_friend_code": chunithm_friend_code,
+            },
             account_name=account_name or maimai_name or chunithm_name or f"lxns_user_{identity.account_key}",
         )
+        await self._store.upsert_provider_credential(
+            provider=LXNS_PLATFORM,
+            provider_account_key=stored.account_key,
+            credential_key=build_account_key(req),
+            credential_method=credential.method.value,
+            credential_json=serialize_account_json(req),
+            is_default=True,
+        )
         await self._store.upsert_game_profile(
+            provider=LXNS_PLATFORM,
             account_key=stored.account_key,
             maimai_name=maimai_name or None,
             maimai_friend_code=maimai_friend_code or None,

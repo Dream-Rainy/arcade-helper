@@ -8,6 +8,7 @@ from .dump import (
     AccountStoreDump,
     AccountStoreImportResult,
     DumpableAccountStore,
+    ProviderCredentialDumpRecord,
 )
 from .local import JsonAccountStore
 from .migration import AccountStoreMigrationResult, migrate_account_store
@@ -22,6 +23,7 @@ __all__ = [
     "AccountStoreMigrationResult",
     "DumpableAccountStore",
     "JsonAccountStore",
+    "ProviderCredentialDumpRecord",
     "migrate_account_store",
 ]
 

@@ -1,104 +1,197 @@
-"""CHUNITHM player domain handles and raw data wrappers."""
+"""CHUNITHM player domain handles and LXNS response models."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+
 from arcade_helper.core.result import DataResult
 from arcade_helper.users import PlatformIdentity
 
 
-@dataclass(frozen=True)
-class ChunithmProfile:
-    """Raw CHUNITHM player profile result."""
+class _ChunithmModel(BaseModel):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
 
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
-
-
-@dataclass(frozen=True)
-class ChunithmBests:
-    """Raw CHUNITHM rating bests result."""
-
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
+    @property
+    def raw(self) -> dict[str, Any]:
+        """Backward-compatible raw-ish view of the parsed payload."""
+        return self.model_dump(mode="python", exclude_none=True)
 
 
-@dataclass(frozen=True)
-class ChunithmBest:
-    """Raw single CHUNITHM best score result."""
-
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
+class ChunithmClassEmblem(_ChunithmModel):
+    base: int | None = None
+    medal: int | None = None
 
 
-@dataclass(frozen=True)
-class ChunithmSongBests:
-    """Raw CHUNITHM song score list result."""
-
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
-
-
-@dataclass(frozen=True)
-class ChunithmRecents:
-    """Raw CHUNITHM recent plays result."""
-
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
+class ChunithmCollectionRequiredSong(_ChunithmModel):
+    id: int | None = None
+    title: str | None = None
+    type: str | None = None
+    completed: bool | None = None
+    completed_difficulties: list[int] | None = None
 
 
-@dataclass(frozen=True)
-class ChunithmScores:
-    """Raw CHUNITHM full scores result."""
-
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
-
-
-@dataclass(frozen=True)
-class ChunithmHeatmap:
-    """Raw CHUNITHM play heatmap result."""
-
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
+class ChunithmCollectionRequired(_ChunithmModel):
+    difficulties: list[int] | None = None
+    rank: str | None = None
+    full_combo: str | None = None
+    full_chain: str | None = None
+    songs: list[ChunithmCollectionRequiredSong] | None = None
+    completed: bool | None = None
 
 
-@dataclass(frozen=True)
-class ChunithmTrend:
-    """Raw CHUNITHM rating trend result."""
+class ChunithmCollection(_ChunithmModel):
+    """CHUNITHM Collection."""
 
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
-
-
-@dataclass(frozen=True)
-class ChunithmScoreHistory:
-    """Raw CHUNITHM score history result."""
-
-    friend_code: str
-    raw: Any
-    provider: str = "lxns"
+    id: int | None = Field(None, validation_alias=AliasChoices("id", "collection_id"))
+    name: str | None = None
+    color: str | None = None
+    level: int | None = None
+    required: list[ChunithmCollectionRequired] | None = None
+    collection_type: str = ""
+    collection_id: int | None = None
 
 
-@dataclass(frozen=True)
-class ChunithmCollection:
-    """Raw CHUNITHM player collection item result."""
+class ChunithmProfile(_ChunithmModel):
+    """CHUNITHM Player."""
 
-    friend_code: str
-    collection_type: str
-    collection_id: int
-    raw: Any
-    provider: str = "lxns"
+    name: str | None = None
+    level: int | None = None
+    rating: float | None = None
+    rating_possession: str | None = None
+    friend_code: int | str | None = None
+    class_emblem: ChunithmClassEmblem | None = None
+    reborn_count: int | None = None
+    over_power: float | None = None
+    over_power_progress: float | None = None
+    currency: int | None = None
+    total_currency: int | None = None
+    total_play_count: int | None = None
+    trophy: ChunithmCollection | None = None
+    character: ChunithmCollection | None = None
+    name_plate: ChunithmCollection | None = None
+    map_icon: ChunithmCollection | None = None
+    upload_time: str | None = None
+
+
+class ChunithmSimpleScore(_ChunithmModel):
+    """CHUNITHM SimpleScore."""
+
+    id: int | None = Field(None, validation_alias=AliasChoices("id", "song_id", "songId"))
+    song_name: str | None = Field(None, validation_alias=AliasChoices("song_name", "songName", "title"))
+    level: str | None = None
+    level_index: int | None = Field(None, validation_alias=AliasChoices("level_index", "levelIndex"))
+    clear: str | None = None
+    full_combo: str | None = None
+    full_chain: str | None = None
+    rank: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_song(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or not isinstance(data.get("song"), dict):
+            return data
+        song = data["song"]
+        flattened = dict(data)
+        flattened.setdefault("id", song.get("id"))
+        flattened.setdefault("song_name", song.get("song_name") or song.get("title"))
+        return flattened
+
+
+class ChunithmScore(ChunithmSimpleScore):
+    """CHUNITHM Score."""
+
+    score: int | None = None
+    rating: float | None = None
+    over_power: float | None = None
+    play_time: str | None = Field(None, validation_alias=AliasChoices("play_time", "playTime", "playedAt"))
+    upload_time: str | None = Field(None, validation_alias=AliasChoices("upload_time", "uploadTime"))
+    last_played_time: str | None = Field(None, validation_alias=AliasChoices("last_played_time", "lastPlayedTime"))
+
+
+class ChunithmBest(ChunithmScore):
+    """Single CHUNITHM Score returned by the best endpoint."""
+
+
+class ChunithmBests(_ChunithmModel):
+    """CHUNITHM rating composition payload."""
+
+    rating: float | None = None
+    bests_rating: float | None = None
+    selections_rating: float | None = None
+    recents_rating: float | None = None
+    new_bests_rating: float | None = None
+    bests: list[ChunithmScore] = Field(default_factory=list)
+    selections: list[ChunithmScore] = Field(default_factory=list)
+    recents: list[ChunithmScore] = Field(default_factory=list)
+    new_bests: list[ChunithmScore] = Field(default_factory=list)
+
+
+class ChunithmSongBests(_ChunithmModel):
+    """CHUNITHM scores for one song."""
+
+    scores: list[ChunithmScore] = Field(default_factory=list)
+
+    @property
+    def raw(self) -> list[dict[str, Any]] | dict[str, Any]:
+        if self.scores:
+            return [score.raw for score in self.scores]
+        return super().raw
+
+
+class ChunithmRecents(ChunithmSongBests):
+    """CHUNITHM Recent 50 payload."""
+
+
+class ChunithmScores(_ChunithmModel):
+    """CHUNITHM SimpleScore list."""
+
+    scores: list[ChunithmSimpleScore] = Field(default_factory=list)
+
+    @property
+    def raw(self) -> list[dict[str, Any]] | dict[str, Any]:
+        if self.scores:
+            return [score.raw for score in self.scores]
+        return super().raw
+
+
+class ChunithmHeatmap(_ChunithmModel):
+    """CHUNITHM play heatmap payload."""
+
+    records: Any = None
+
+    @property
+    def raw(self) -> Any:
+        return self.records if self.records is not None else super().raw
+
+
+class ChunithmRatingTrend(_ChunithmModel):
+    """CHUNITHM RatingTrend."""
+
+    rating: float | None = None
+    bests_rating: float | None = None
+    selections_rating: float | None = None
+    recents_rating: float | None = None
+    new_bests_rating: float | None = None
+    date: str | None = None
+
+
+class ChunithmTrend(_ChunithmModel):
+    """CHUNITHM rating trend payload."""
+
+    trend: list[ChunithmRatingTrend] = Field(default_factory=list)
+
+    @property
+    def raw(self) -> list[dict[str, Any]] | dict[str, Any]:
+        if self.trend:
+            return [item.raw for item in self.trend]
+        return super().raw
+
+
+class ChunithmScoreHistory(ChunithmSongBests):
+    """CHUNITHM score history payload."""
 
 
 @dataclass(frozen=True)
@@ -206,13 +299,19 @@ class ChunithmPlayer:
 __all__ = [
     "ChunithmBest",
     "ChunithmBests",
+    "ChunithmClassEmblem",
     "ChunithmCollection",
+    "ChunithmCollectionRequired",
+    "ChunithmCollectionRequiredSong",
     "ChunithmHeatmap",
     "ChunithmPlayer",
     "ChunithmProfile",
+    "ChunithmRatingTrend",
     "ChunithmRecents",
+    "ChunithmScore",
     "ChunithmScoreHistory",
     "ChunithmScores",
+    "ChunithmSimpleScore",
     "ChunithmSongBests",
     "ChunithmTrend",
 ]

@@ -69,6 +69,45 @@ class AccountDumpRecord:
 
 
 @dataclass(frozen=True)
+class ProviderCredentialDumpRecord:
+    """Portable credential record for a provider account."""
+
+    user_id: int
+    provider: str
+    provider_account_key: str
+    credential_key: str
+    credential_method: str
+    credential_json: dict[str, Any] = field(default_factory=dict)
+    schema_version: int = 1
+    is_default: bool = False
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "user_id": self.user_id,
+            "provider": self.provider,
+            "provider_account_key": self.provider_account_key,
+            "credential_key": self.credential_key,
+            "credential_method": self.credential_method,
+            "credential_json": dict(self.credential_json),
+            "schema_version": self.schema_version,
+            "is_default": self.is_default,
+        }
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> "ProviderCredentialDumpRecord":
+        return cls(
+            user_id=int(data["user_id"]),
+            provider=str(data["provider"]),
+            provider_account_key=str(data["provider_account_key"]),
+            credential_key=str(data["credential_key"]),
+            credential_method=str(data["credential_method"]),
+            credential_json=dict(data.get("credential_json") or {}),
+            schema_version=int(data.get("schema_version") or 1),
+            is_default=bool(data.get("is_default", False)),
+        )
+
+
+@dataclass(frozen=True)
 class AccountStoreDump:
     """Portable account binding and OAuth token dump.
 
@@ -79,12 +118,16 @@ class AccountStoreDump:
     schema_version: int = ACCOUNT_STORE_DUMP_SCHEMA_VERSION
     users: tuple[AccountDumpUser, ...] = ()
     accounts: tuple[AccountDumpRecord, ...] = ()
+    provider_accounts: tuple[AccountDumpRecord, ...] = ()
+    provider_credentials: tuple[ProviderCredentialDumpRecord, ...] = ()
 
     def to_json(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
             "users": [user.to_json() for user in self.users],
             "accounts": [account.to_json() for account in self.accounts],
+            "provider_accounts": [account.to_json() for account in self.provider_accounts],
+            "provider_credentials": [credential.to_json() for credential in self.provider_credentials],
         }
 
     @classmethod
@@ -96,6 +139,10 @@ class AccountStoreDump:
             schema_version=schema_version,
             users=tuple(AccountDumpUser.from_json(item) for item in data.get("users", [])),
             accounts=tuple(AccountDumpRecord.from_json(item) for item in data.get("accounts", [])),
+            provider_accounts=tuple(AccountDumpRecord.from_json(item) for item in data.get("provider_accounts", [])),
+            provider_credentials=tuple(
+                ProviderCredentialDumpRecord.from_json(item) for item in data.get("provider_credentials", [])
+            ),
         )
 
 
@@ -132,4 +179,5 @@ __all__ = [
     "AccountStoreDump",
     "AccountStoreImportResult",
     "DumpableAccountStore",
+    "ProviderCredentialDumpRecord",
 ]

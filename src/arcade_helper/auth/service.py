@@ -183,6 +183,7 @@ class AuthService:
             raise AccountNotBoundError("无法获取用户信息，请检查OAuth2.0令牌是否有效")
 
         await self._store.upsert_game_profile(
+            provider=LXNS_PLATFORM,
             account_key=account_key,
             maimai_name=maimai_name or None,
             maimai_friend_code=maimai_friend_code or None,
@@ -194,22 +195,35 @@ class AuthService:
     async def ensure_lxns_token_valid(self, *, account_key: str) -> dict:
         """Return valid LXNS token data, refreshing and storing it when needed."""
         self._ensure_started()
+        credential = await self._store.get_provider_credential(
+            provider=LXNS_PLATFORM,
+            provider_account_key=account_key,
+            credential_method="oa",
+        )
         account = await self._store.get_provider_account(provider=LXNS_PLATFORM, account_key=account_key)
-        if account is None:
+        if credential is None and account is None:
             raise AccountNotBoundError(f"LXNS account not found: {account_key}")
 
-        token_data = _token_data_from_account_json(account.account_json)
+        token_data = _token_data_from_account_json(
+            credential.credential_json if credential is not None else account.account_json
+        )
         if _token_is_valid(token_data):
             return token_data
 
         lock_key = (LXNS_PLATFORM, account_key)
         lock = self._refresh_locks.setdefault(lock_key, asyncio.Lock())
         async with lock:
+            latest_credential = await self._store.get_provider_credential(
+                provider=LXNS_PLATFORM,
+                provider_account_key=account_key,
+                credential_method="oa",
+            )
             latest = await self._store.get_provider_account(provider=LXNS_PLATFORM, account_key=account_key)
-            if latest is None:
+            if latest_credential is None and latest is None:
                 raise AccountNotBoundError(f"LXNS account not found: {account_key}")
 
-            latest_token_data = _token_data_from_account_json(latest.account_json)
+            latest_json = latest_credential.credential_json if latest_credential is not None else latest.account_json
+            latest_token_data = _token_data_from_account_json(latest_json)
             if _token_is_valid(latest_token_data):
                 return latest_token_data
 
@@ -217,6 +231,15 @@ class AuthService:
             try:
                 refreshed = await self.lxns_oauth.refresh_token(refresh_token)
             except Exception as exc:  # noqa: BLE001
+                reread_credential = await self._store.get_provider_credential(
+                    provider=LXNS_PLATFORM,
+                    provider_account_key=account_key,
+                    credential_method="oa",
+                )
+                if reread_credential is not None:
+                    reread_token_data = _token_data_from_account_json(reread_credential.credential_json)
+                    if _token_is_valid(reread_token_data):
+                        return reread_token_data
                 reread = await self._store.get_provider_account(provider=LXNS_PLATFORM, account_key=account_key)
                 if reread is not None:
                     reread_token_data = _token_data_from_account_json(reread.account_json)
@@ -224,7 +247,7 @@ class AuthService:
                         return reread_token_data
                 raise TokenRefreshError("无法刷新 access token，可能是 refresh token 已过期或无效") from exc
 
-            updated_json = dict(latest.account_json)
+            updated_json = dict(latest_json)
             updated_json.update(
                 {
                     "oauth2_access_token": refreshed["access_token"],
@@ -235,13 +258,31 @@ class AuthService:
                     else None,
                 }
             )
-            ok = await self._store.update_provider_account_json_if_current(
-                provider=LXNS_PLATFORM,
-                account_key=account_key,
-                account_json=updated_json,
-                expected_refresh_token=refresh_token,
-            )
+            if latest_credential is not None:
+                ok = await self._store.update_provider_credential_json_if_current(
+                    provider=LXNS_PLATFORM,
+                    provider_account_key=account_key,
+                    credential_key=latest_credential.credential_key,
+                    credential_json=updated_json,
+                    expected_refresh_token=refresh_token,
+                )
+            else:
+                ok = await self._store.update_provider_account_json_if_current(
+                    provider=LXNS_PLATFORM,
+                    account_key=account_key,
+                    account_json=updated_json,
+                    expected_refresh_token=refresh_token,
+                )
             if not ok:
+                reread_credential = await self._store.get_provider_credential(
+                    provider=LXNS_PLATFORM,
+                    provider_account_key=account_key,
+                    credential_method="oa",
+                )
+                if reread_credential is not None:
+                    reread_token_data = _token_data_from_account_json(reread_credential.credential_json)
+                    if _token_is_valid(reread_token_data):
+                        return reread_token_data
                 reread = await self._store.get_provider_account(provider=LXNS_PLATFORM, account_key=account_key)
                 if reread is not None:
                     reread_token_data = _token_data_from_account_json(reread.account_json)
