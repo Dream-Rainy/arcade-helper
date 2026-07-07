@@ -706,6 +706,12 @@ async def _query_song_bm25(
     return results
 
 
+def _bm25_is_confident(results: list[SongQueryResult]) -> bool:
+    if len(results) <= 1:
+        return bool(results)
+    return (results[0].match_score - results[1].match_score) >= 8.0
+
+
 async def _query_song_embedding(
     query: str,
     *,
@@ -1465,8 +1471,8 @@ async def search_song(
     3. 别名精确匹配（命中即返回）
     4. 归一化精确匹配（NFKC / 简繁 / 分隔符）
     5. 罗马字/ASCII transliteration 别名
-    6. BM25 候选召回（多词 title / artist / alias 查询）
-    7. 模糊匹配（标题 + 别名 + 拼音 + 简体化归一）
+    6. 模糊匹配（标题 + 别名 + 拼音 + 简体化归一）
+    7. BM25 候选召回（多词 title / artist / alias 查询）
     8. 可选本地 embedding 兜底（默认关闭）
 
     Args:
@@ -1486,15 +1492,28 @@ async def search_song(
         f"[search][trace={trace_id}] game={gc} query={query!r} prefix_retry={_prefix_retry}"
     )
 
-    # 1. 尝试 ID 匹配（如果是数字）
+    # 1. 数字查询：并行尝试 ID 精确匹配与标题精确匹配，避免数字 ID 与数字曲名冲突
+    #    （例如某曲目标题恰好是另一曲目的 ID）时标题匹配永远无法被触达。
+    numeric_query: str | None = None
     if isinstance(query, int):
-        result = await query_song_by_id(query, game_code=gc)
-        if result:
-            return _finish([result])
+        numeric_query = str(query)
     elif isinstance(query, str) and query.isdigit():
-        result = await query_song_by_id(int(query), game_code=gc)
-        if result:
-            return _finish([result])
+        numeric_query = query
+
+    if numeric_query is not None:
+        id_result = await query_song_by_id(int(numeric_query), game_code=gc)
+        title_results = await query_song_by_title_exact(numeric_query, game_code=gc)
+        combined: list[SongQueryResult] = []
+        seen_ids: set[int] = set()
+        if id_result:
+            combined.append(id_result)
+            seen_ids.add(id_result.song_id)
+        for r in title_results:
+            if r.song_id not in seen_ids:
+                combined.append(r)
+                seen_ids.add(r.song_id)
+        if combined:
+            return _finish(combined)
 
     query_str = str(query).strip()
     if not query_str:
@@ -1519,21 +1538,25 @@ async def search_song(
     if romaji_results:
         return _finish(romaji_results)
 
-    # 6. BM25 候选召回（短 ASCII 查询保留词边界 fuzzy 保护）
-    if _has_multiple_search_terms(query_str):
-        bm25_results = await _query_song_bm25(query_str, game_code=gc)
-        if bm25_results:
-            return _finish(bm25_results)
-
-    # 7. 模糊匹配
+    # 6. 模糊匹配
     fuzzy_results = await query_song_fuzzy(query_str, trace_id=trace_id, game_code=gc)
     if fuzzy_results:
         return _finish(fuzzy_results)
+
+    # 7. BM25 兜底召回；多候选差距太小时先让 embedding 接管。
+    bm25_results: list[SongQueryResult] = []
+    if _has_multiple_search_terms(query_str):
+        bm25_results = await _query_song_bm25(query_str, game_code=gc)
+        if _bm25_is_confident(bm25_results):
+            return _finish(bm25_results)
 
     # 8. 可选本地 embedding 兜底（默认关闭）
     embedding_results = await _query_song_embedding(query_str, game_code=gc)
     if embedding_results:
         return _finish(embedding_results)
+
+    if bm25_results:
+        return _finish(bm25_results)
 
     # 9. 无结果时兜底：剥离难度/版本前缀重试一次（避免误伤真实歌名）
     if _prefix_retry and isinstance(query, str):
