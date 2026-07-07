@@ -16,9 +16,12 @@ class MatchType(Enum):
     EXACT_ALIAS = "exact_alias"
     FUZZY_TITLE = "fuzzy_title"
     FUZZY_ALIAS = "fuzzy_alias"
+    BM25 = "bm25"
     PINYIN_INITIALS = "pinyin_initials"
     PINYIN_FULL = "pinyin_full"
+    ROMAJI = "romaji"
     SIMPLIFIED = "simplified"
+    EMBEDDING = "embedding"
 
 
 @dataclass(frozen=True)
