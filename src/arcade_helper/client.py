@@ -8,6 +8,7 @@ from typing import Any
 
 from .auth import AuthService
 from .catalog import SongCatalogService
+from .aliases import AliasService
 from .core.context import CatalogContext, HttpGetJson, HttpPostJson
 from .core.errors import (
     ClientClosedError,
@@ -59,6 +60,10 @@ class ArcadeHelperClient:
         providers: ProviderRegistry | None = None,
         account_store: AccountStore | None = None,
         song_store: Any | None = None,
+        catalog_store: Any | None = None,
+        alias_policy: Any | None = None,
+        alias_daily_limit: int = 20,
+        alias_pending_limit: int = 5,
     ):
         self._state = "created"
         self.lifecycle = ArcadeHelperLifecycle(self)
@@ -114,8 +119,11 @@ class ArcadeHelperClient:
         self.catalog = SongCatalogService(
             providers=self.providers,
             song_store=song_store,
+            catalog_store=catalog_store,
             logger=self.context.logger,
         )
+        self.aliases = AliasService(catalog_store, policy=alias_policy, daily_limit=alias_daily_limit, pending_limit=alias_pending_limit)
+        self.catalog.aliases = self.aliases
 
     @classmethod
     def from_context(
@@ -133,6 +141,10 @@ class ArcadeHelperClient:
         account_store: AccountStore | None = None,
         local_data_dir: str | Path | None = None,
         song_store: Any | None = None,
+        catalog_store: Any | None = None,
+        alias_policy: Any | None = None,
+        alias_daily_limit: int = 20,
+        alias_pending_limit: int = 5,
     ) -> "ArcadeHelperClient":
         """Build a client from an existing context and optional stores/providers."""
         client = cls.__new__(cls)
@@ -183,8 +195,11 @@ class ArcadeHelperClient:
         client.catalog = SongCatalogService(
             providers=client.providers,
             song_store=song_store,
+            catalog_store=catalog_store,
             logger=client.context.logger,
         )
+        client.aliases = AliasService(catalog_store, policy=alias_policy, daily_limit=alias_daily_limit, pending_limit=alias_pending_limit)
+        client.catalog.aliases = client.aliases
         return client
 
     @property

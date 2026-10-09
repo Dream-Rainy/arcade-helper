@@ -33,9 +33,9 @@ def _maimai_song_from_row(row: Any, aliases: list[str]) -> MaiSongData:
     return MaiSongData.from_dict({
         "id": row.id,
         "title": row.title,
-        "artist": row.artist,
+        "artist": row.artist or "",
         "category": row.category,
-        "bpm": row.bpm,
+        "bpm": row.bpm or 0,
         "version": row.version,
         "rights": row.rights,
         "mai_map": row.mai_map,
@@ -156,13 +156,13 @@ class TortoiseSongStore:
             }
         raise ValueError(f"Unsupported game_code: {game_code}")
 
-    async def sync_songs(self, game_code: str, song_data: dict[int, SongData]) -> None:
+    async def sync_songs(self, game_code: str, song_data: dict[int, SongData], *, write_aliases: bool = True) -> None:
         spec = self._spec(game_code)
         self.logger.info(f"[{game_code}] 开始同步乐曲数据到数据库，共 {len(song_data)} 首")
 
         try:
-            deleted_aliases = await spec.alias_model.filter(song_id__gte=spec.temp_id_threshold).delete()
-            deleted_songs = await spec.song_model.filter(id__gte=spec.temp_id_threshold).delete()
+            deleted_aliases = await spec.alias_model.filter(song_id__gte=spec.temp_id_threshold).delete() if write_aliases else 0
+            deleted_songs = await spec.song_model.filter(id__gte=spec.temp_id_threshold).delete() if write_aliases else 0
             if deleted_aliases or deleted_songs:
                 self.logger.info(
                     f"[{game_code}] 已清理历史临时乐曲数据："
@@ -182,6 +182,9 @@ class TortoiseSongStore:
             update_fields = list(self._song_to_defaults(game_code, next(iter(song_data.values()))))
             await _bulk_upsert(spec.song_model, song_rows, update_fields)
             synced_count = len(song_rows)
+
+        if not write_aliases:
+            return
 
         song_ids = list(song_data)
         existing_alias_rows = (
@@ -330,6 +333,27 @@ class TortoiseSongStore:
 
         self.logger.info(f"maimai 地图奖励数据同步完成：{len(rows)} 个奖励")
 
+    async def get_songs_by_ids(self, game_code: str, song_ids: list[int]) -> dict[int, SongData]:
+        """Read native rows and legacy aliases in two bounded queries."""
+        spec = self._spec(game_code)
+        ids = list(dict.fromkeys(song_ids))
+        if not ids:
+            return {}
+        try:
+            rows = await spec.song_model.filter(id__in=ids)
+            aliases: dict[int, list[str]] = {}
+            for sid, text in await spec.alias_model.filter(song_id__in=[row.id for row in rows]).order_by(
+                "priority", "id",
+            ).values_list("song_id", "alias"):
+                if text:
+                    aliases.setdefault(sid, []).append(str(text))
+            songs = {row.id: self._song_from_row(game_code, row, aliases.get(row.id, [])) for row in rows}
+            return {sid: songs[sid] for sid in ids if sid in songs}
+        except Exception as e:
+            self.logger.error(f"[{game_code}] 从数据库批量加载乐曲失败: {e}")
+            traceback.print_exc()
+            return {}
+
     async def get_song_by_id(self, game_code: str, song_id: int) -> SongData | None:
         spec = self._spec(game_code)
         try:
@@ -346,7 +370,7 @@ class TortoiseSongStore:
             traceback.print_exc()
             return None
 
-    async def load_all_songs(self, game_code: str) -> dict[int, SongData]:
+    async def load_all_songs(self, game_code: str, *, strict: bool = False) -> dict[int, SongData]:
         spec = self._spec(game_code)
         self.logger.info(f"[{game_code}] 从数据库加载乐曲历史数据...")
         try:
@@ -374,8 +398,18 @@ class TortoiseSongStore:
             }
         except Exception as e:
             self.logger.error(f"[{game_code}] 从数据库加载乐曲数据失败: {e}")
+            if strict:
+                raise
             traceback.print_exc()
             return {}
+
+    async def load_search_songs(self, game_code: str) -> dict[int, SongData]:
+        rows = await self._spec(game_code).song_model.all().values("id", "title", "artist")
+        return {r["id"]: SongData(**r) for r in rows}
+
+    async def query_title_exact(self, game_code: str, title: str) -> list[tuple[int, str]]:
+        from arcade_helper.core.song_identity import normalize_width
+        return await self._spec(game_code).song_model.filter(title__iexact=normalize_width(title)).values_list("id", "title")
 
     async def load_song_index(self, game_code: str) -> dict[int, str]:
         spec = self._spec(game_code)

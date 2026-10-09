@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping
 import math
 
 from rapidfuzz import fuzz
@@ -37,18 +38,17 @@ def _has_multiple_search_terms(query: str) -> bool:
 
 
 def _bm25_score(
-    query_terms: list[str],
+    query_counts: Mapping[str, int],
     document: _SearchDocument,
     *,
     total_docs: int,
     doc_freq: Counter[str],
     avg_len: float,
 ) -> float:
-    if not query_terms or document.bm25_len <= 0 or total_docs <= 0:
+    if not query_counts or document.bm25_len <= 0 or total_docs <= 0:
         return 0.0
 
     score = 0.0
-    query_counts = Counter(query_terms)
     for term, query_freq in query_counts.items():
         freq = document.bm25_counts.get(term, 0)
         if freq <= 0:

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Generic, TypeVar
 from pydantic import BaseModel, ConfigDict, Field
+from arcade_helper.aliases.models import AliasObservation
 
 
 class SongSheet(BaseModel):
@@ -47,6 +48,10 @@ class SongData(BaseModel, Generic[SongSheetT]):
     image_name: str = ""
     difficulties: dict[str, list[SongSheetT]] = Field(default_factory=dict)
     aliases: list[str] = Field(default_factory=list)
+    alias_observations: list[AliasObservation] = Field(default_factory=list)
+    alias_complete_sources: list[str] = Field(default_factory=list)
+    # None means unknown; source adapters may explicitly set () for a literal title.
+    chart_variant: tuple[str, ...] | None = None
 
     # 各游戏域共有的可选字段
     rights: str | None = None

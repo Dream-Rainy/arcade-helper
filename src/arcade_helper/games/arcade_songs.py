@@ -18,6 +18,7 @@ from pydantic import Field
 
 from arcade_helper.core.context import CatalogContext
 from arcade_helper.core.song import SongData, SongSheet
+from arcade_helper.core.song_identity import normalize_width, parse_chart_title
 from arcade_helper.providers.base import ProviderApiResponse
 from arcade_helper.providers.operations import ProviderOperation
 
@@ -117,28 +118,35 @@ def normalize_arcade_songs_catalog(payload: dict[str, Any]) -> dict[int, ArcadeS
     for index, raw_song in enumerate(payload.get("songs") or [], start=1):
         if not isinstance(raw_song, dict):
             continue
-        title = str(raw_song.get("title") or "").strip()
+        title = normalize_width(str(raw_song.get("title") or ""))
         if not title:
             continue
-        song = ArcadeSongData.model_validate(
-            {
-                "id": index,
-                "title": title,
-                "artist": raw_song.get("artist") or "",
-                "bpm": raw_song.get("bpm") or 0,
-                "image_name": raw_song.get("imageName") or "",
-                "difficulties": _group_sheets(raw_song.get("sheets") or []),
-                "aliases": [title],
-                "category": raw_song.get("category"),
-                "comment": raw_song.get("comment") or "",
-                "is_locked": bool(raw_song.get("isLocked", False)),
-                "is_new": bool(raw_song.get("isNew", False)),
-                "release_date": raw_song.get("releaseDate") or "",
-                "version": raw_song.get("version"),
-            }
-        )
+        song = normalize_arcade_song(raw_song, song_id=index)
         songs[song.id] = song
     return songs
+
+
+def normalize_arcade_song(raw_song: dict[str, Any], *, song_id: int) -> ArcadeSongData:
+    """Normalize one record using an ID assigned by the caller."""
+    title = normalize_width(str(raw_song.get("title") or ""))
+    return ArcadeSongData.model_validate(
+        {
+            "id": song_id,
+            "title": title,
+            "chart_variant": parse_chart_title(title)[1],
+            "artist": raw_song.get("artist") or "",
+            "bpm": raw_song.get("bpm") or 0,
+            "image_name": raw_song.get("imageName") or "",
+            "difficulties": _group_sheets(raw_song.get("sheets") or []),
+            "aliases": [title],
+            "category": raw_song.get("category"),
+            "comment": raw_song.get("comment") or "",
+            "is_locked": bool(raw_song.get("isLocked", False)),
+            "is_new": bool(raw_song.get("isNew", False)),
+            "release_date": raw_song.get("releaseDate") or "",
+            "version": raw_song.get("version"),
+        }
+    )
 
 
 @dataclass
@@ -170,6 +178,13 @@ class ArcadeSongsProvider:
             force_refresh=force_refresh,
         )
 
+    async def payload(self, game_code: str, *, force_refresh: bool = False) -> dict[str, Any]:
+        """Fetch the original records for persistent identity resolution."""
+        return await fetch_arcade_songs_payload(
+            self.context, game_code, cache_dir=self.cache_dir,
+            cache_ttl_seconds=self.cache_ttl_seconds, force_refresh=force_refresh,
+        )
+
     async def call_api(
         self,
         method: Literal["GET", "POST"],
@@ -191,6 +206,10 @@ class ArcadeSongsProvider:
     def operations(self) -> tuple[ProviderOperation, ...]:
         """Provider operation metadata exposed to ``ProviderRegistry``."""
         return (
+            ProviderOperation(
+                key="arcade_songs.catalog.payload", method="payload",
+                data_kind="catalog_payload", stale_allowed=True, priority=-10,
+            ),
             ProviderOperation(
                 key="arcade_songs.catalog.sites",
                 method="sites",

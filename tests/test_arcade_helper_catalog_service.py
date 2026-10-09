@@ -1,15 +1,253 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
+
+@pytest.mark.asyncio
+async def test_search_in_another_game_does_not_wait_for_blocked_query():
+    from arcade_helper.search.song_query import SongSearchService
+    entered, release = asyncio.Event(), asyncio.Event()
+    service = SongSearchService(SimpleNamespace())
+    async def blocked(*, game_code):
+        entered.set()
+        await release.wait()
+        return game_code
+    async def quick(*, game_code):
+        return game_code
+    task = asyncio.create_task(service._run(blocked, game_code='maimai'))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert await asyncio.wait_for(service._run(quick, game_code='sdvx'), 1) == 'sdvx'
+        assert not task.done()
+    finally:
+        release.set()
+        await task
 
 from arcade_helper.catalog import SongCatalogService
 from arcade_helper.core.context import CatalogContext
 from arcade_helper.games.arcade_songs import ARCADE_SONGS_SITES_URL, ArcadeSongData, ArcadeSongSheet, ArcadeSongsProvider
 from arcade_helper.providers import ProviderOperation, ProviderRegistry
+
+
+@pytest.mark.asyncio
+async def test_index_singleflight_does_not_block_exact_queries_or_publish_obsolete_workers(monkeypatch):
+    from arcade_helper.core.song import SongData
+    from arcade_helper.search import song_query as module
+
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    state = {"revision": 1, "title": "Old Song", "pause": True}
+    identities = SimpleNamespace(_db=object())
+    built = []
+    builder = module._build_search_index
+
+    def paused(*args):
+        built.append(args[1].copy())
+        if state["pause"]:
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(5)
+        return builder(*args)
+
+    async def songs(game):
+        return {1: SongData(id=1, title=state["title"], aliases=[])}
+
+    async def full(game, sid):
+        return SongData(id=sid, title=state["title"], image_name="full.jpg")
+
+    async def exact(game, title):
+        return [(1, state["title"])] if title == state["title"] else []
+
+    async def revision():
+        return state["revision"]
+
+    repository = SimpleNamespace(identities=identities, get_revision=revision,
+        load_search_songs=songs, load_all_songs=songs, get_song_by_id=full, query_title_exact=exact)
+    service = module.SongSearchService(repository)
+    monkeypatch.setattr(module, "_build_search_index", paused)
+    first = asyncio.create_task(service._warm_search_index("sdvx"))
+    second = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        second = asyncio.create_task(service._warm_search_index("sdvx"))
+        result = await asyncio.wait_for(service.query_song_by_title_exact("Old Song", game_code="sdvx"), 1)
+        assert result[0].song_data.image_name == "full.jpg" and not first.done()
+        assert await asyncio.wait_for(service.query_song_by_id(1, game_code="maimai"), 1)
+        assert len(built) == 1
+        state.update(title="New Song", pause=False)
+        identities._db = object()  # Connection changes even with an identical revision.
+        await asyncio.wait_for(service._warm_search_index("sdvx"), 2)
+        release.set()
+        await asyncio.gather(first, second)
+        assert service._cache.indexes[("sdvx", None)].index == {1: "New Song"}
+        # Cancellation during a third build must not publish its eventual output.
+        release.clear()
+        entered.clear()
+        state.update(revision=2, title="Cancelled Song", pause=True)
+        first = asyncio.create_task(service._warm_search_index("sdvx"))
+        await asyncio.wait_for(entered.wait(), 2)
+        await service._stop_index_builds()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        release.set()
+        assert ("sdvx", None) not in service._cache.indexes
+    finally:
+        release.set()
+        await asyncio.gather(first, *([second] if second else []), return_exceptions=True)
+        await service._stop_index_builds()
+
+
+@pytest.mark.asyncio
+async def test_light_candidates_keep_separate_legacy_aliases_and_return_full_songs():
+    from arcade_helper.core.song import SongData, SongSheet
+    from arcade_helper.search import song_query as module
+    reads = []
+
+    async def light(game):
+        return {sid: SongData(id=sid, title=f"Other {sid}") for sid in (1, 2)}
+
+    async def aliases(game):
+        return [(1, "fumoffu"), (2, "fumoffu")]
+
+    async def full(game, sid):
+        reads.append(sid)
+        return SongData(id=sid, title=f"Other {sid}", image_name=f"{sid}.jpg", aliases=["fumoffu"],
+            difficulties={"standard": [SongSheet(type="standard", difficulty="master", level="15")]})
+
+    repository = SimpleNamespace(load_search_songs=light, load_all_songs=light,
+                                 load_alias_records=aliases, get_song_by_id=full)
+    service = module.SongSearchService(repository)
+    results = await service.query_song_fuzzy("fumoffu", game_code="sdvx")
+    assert {r.song_id for r in results} == {1, 2}
+    assert sorted(reads) == [1, 2]
+    assert all(r.song_data.image_name and r.song_data.difficulties["standard"][0].level == "15" for r in results)
+    token = module._repository_var.set(repository)
+    try:
+        legacy = await module.query_song_fuzzy("fumoffu", game_code="sdvx")
+        assert all(r.song_data.image_name and r.song_data.difficulties for r in legacy)
+    finally:
+        module._repository_var.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_maimai_xml_loading_keeps_event_loop_responsive_and_preserves_data(monkeypatch):
+    from arcade_helper.games.maimai import data_fetcher as fetcher
+    from arcade_helper.games.maimai.schemas import MaiSongData, MaiSongSheet
+
+    loop = asyncio.get_running_loop()
+    main_thread = threading.get_ident()
+    entered = asyncio.Queue()
+    gates = []
+    maps = {1: SimpleNamespace(map_name='Map')}
+    treasures = {2: SimpleNamespace(music_id=7, music_name=' Sample ')}
+    bonuses = {3: SimpleNamespace(music_names={8: ' Bonus '}, map_name='Bonus Map')}
+    counts = {'tap': 12, 'hold': 3, 'slide': 4, 'break': 1, 'touch': 2}
+    music = {7: {'title': 'Sample', 'artist': 'XML Artist', 'bpm': 180,
+                  'difficulties': {'standard': [{'note_counts': counts}]}}}
+    phases = {
+        'scan_map_directory': maps,
+        'extract_music_ids_from_maps': {7: 1},
+        'scan_map_treasure_directory': treasures,
+        'scan_map_bonus_music_directory': bonuses,
+        'scan_music_directory': music,
+        '_enrich_with_music_xml': None,
+    }
+    for name, result in phases.items():
+        original = getattr(fetcher, name)
+        def blocked(*args, _name=name, _result=result, _original=original):
+            gate = threading.Event()
+            gates.append(gate)
+            loop.call_soon_threadsafe(entered.put_nowait, (_name, gate))
+            assert gate.wait(5), 'XML blocked the event loop instead of allowing the command coroutine to run'
+            if _name == '_enrich_with_music_xml':
+                return _original(*args)
+            return _result
+        monkeypatch.setattr(fetcher, name, blocked)
+
+    callbacks = []
+    async def sync_maps(data):
+        assert asyncio.get_running_loop() is loop and threading.get_ident() == main_thread
+        callbacks.append(('maps', data))
+    async def sync_treasures(data):
+        assert asyncio.get_running_loop() is loop and threading.get_ident() == main_thread
+        callbacks.append(('treasures', data))
+    async def get_json(url, **kwargs):
+        return {'data': {'fixture': 1}} if 'config' in url else {'aliases': [], 'content': []}
+    def merge(*args):
+        assert args[3:] == ({7: 1}, {1: 'Map'}, {'sample': 7, 'bonus': 8}, {8: 'Bonus Map'})
+        return {10000001: MaiSongData(id=10000001, title='Sample', artist='',
+                difficulties={'standard': [MaiSongSheet(type='std', difficulty='basic', level='1', level_value=1)]})}
+    monkeypatch.setattr(fetcher, '_merge_dxrating_and_lxns', merge)
+    context = CatalogContext(http_get_json=get_json, ingame_data_base_dir='fixture')
+    task = asyncio.create_task(fetcher.fetch_maimai_catalog(context, sync_map_data=sync_maps, sync_map_treasure_data=sync_treasures))
+    try:
+        for expected in phases:
+            name, gate = await asyncio.wait_for(entered.get(), 5)
+            assert name == expected and not task.done()
+            # This is the command coroutine: it must execute while disk/XML work is still blocked.
+            await asyncio.sleep(0)
+            assert not gate.is_set()
+            gate.set()
+        result = await asyncio.wait_for(task, 5)
+    finally:
+        for gate in gates:
+            gate.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert callbacks == [('maps', maps), ('treasures', treasures)]
+    assert list(result.songs) == [7]  # XML title matching corrected the synthetic song ID.
+    song = result.songs[7]
+    assert (song.artist, song.bpm) == ('XML Artist', 180)
+    assert song.difficulties['standard'][0].note_counts == counts
+
+
+@pytest.mark.asyncio
+async def test_chunithm_xml_scan_keeps_event_loop_responsive(monkeypatch):
+    from arcade_helper.games.chunithm import data_fetcher as fetcher
+
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    xml_data = {7: {'title': 'Sample'}}
+
+    def scan(path):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5), 'CHUNITHM XML scan blocked the event loop'
+        return xml_data
+
+    async def get_json(*args, **kwargs):
+        return {'songs': [], 'aliases': []}
+
+    async def fetch_arcade(*args):
+        return {'songs': []}
+
+    def merge(arcade, lxns, xml, logger):
+        assert xml is xml_data
+        return {}
+
+    monkeypatch.setattr(fetcher, 'scan_music_directory', scan)
+    monkeypatch.setattr(fetcher, '_fetch_arcade_data_json', fetch_arcade)
+    monkeypatch.setattr(fetcher, 'merge_chuni_arcade_and_lxns', merge)
+    context = CatalogContext(http_get_json=get_json, ingame_data_base_dir='fixture')
+    task = asyncio.create_task(fetcher.fetch_chunithm_catalog(context))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert not task.done()
+        release.set()
+        assert await asyncio.wait_for(task, 5) == {}
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @dataclass
@@ -114,14 +352,19 @@ def _service() -> tuple[SongCatalogService, _Provider, _Store]:
 
 
 @pytest.mark.asyncio
-async def test_catalog_service_syncs_provider_catalog_into_store() -> None:
+@pytest.mark.parametrize("include_songs", [True, False])
+async def test_catalog_service_syncs_provider_catalog_into_store(include_songs, monkeypatch) -> None:
     service, provider, store = _service()
 
-    result = await service.sync_game_from_remote("maimai", current_data_version=3)
+    if not include_songs:
+        async def forbidden(*args, **kwargs):
+            pytest.fail("background sync must not read back full songs")
+        monkeypatch.setattr(service, "load_all_songs", forbidden)
+    result = await service.sync_game_from_remote("maimai", current_data_version=3, **({"include_songs": False} if not include_songs else {}))
 
     assert result.ok
     assert result.data_version == 7
-    assert result.songs == {101: _Song("song")}
+    assert result.songs == ({101: _Song("song")} if include_songs else None)
     assert provider.catalog_calls[0]["current_data_version"] == 3
     assert store.synced == [("maimai", {101: _Song("song")})]
     assert store.maps == [{1: "map"}]

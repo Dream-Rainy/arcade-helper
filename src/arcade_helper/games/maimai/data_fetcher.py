@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
 from ...core.context import CatalogContext
+from ...aliases.models import AliasObservation
 from ...integrations.lxns.constants import (
     maimai_song_list_url,
     maimai_alias_list_url,
@@ -109,12 +111,12 @@ async def _parse_map_xml(
     map_bonus_music_dir = _ingame_path(context, "mapBonusMusic")
 
     logger.info(f"开始解析Map XML文件: {map_dir}")
-    maps = scan_map_directory(map_dir, map_treasure_dir)
+    maps = await asyncio.to_thread(scan_map_directory, map_dir, map_treasure_dir)
 
     if maps:
         logger.info(f"成功解析 {len(maps)} 个地图数据")
-        music_id_to_map_id = extract_music_ids_from_maps(
-            maps, map_treasure_dir, map_bonus_music_dir,
+        music_id_to_map_id = await asyncio.to_thread(
+            extract_music_ids_from_maps, maps, map_treasure_dir, map_bonus_music_dir,
         )
         map_id_to_map_name = {mid: m.map_name for mid, m in maps.items()}
         logger.info(f"从Map及其从属的MapTreasure提取到 {len(music_id_to_map_id)} 个music_id→map_id关联")
@@ -125,7 +127,7 @@ async def _parse_map_xml(
         logger.info("未找到Map数据或解析失败")
 
     logger.info(f"开始解析Map的MapTreasure奖励数据: {map_treasure_dir}")
-    map_treasures = scan_map_treasure_directory(map_treasure_dir)
+    map_treasures = await asyncio.to_thread(scan_map_treasure_directory, map_treasure_dir)
     if map_treasures:
         logger.info(f"成功解析 {len(map_treasures)} 个Map奖励数据")
         if sync_map_treasure_data is not None:
@@ -138,7 +140,7 @@ async def _parse_map_xml(
         logger.info(f"从Map奖励提取到 {len(title_to_music_id)} 个title→music_id映射")
 
     logger.info(f"开始解析MapBonusMusic XML文件: {map_bonus_music_dir}")
-    map_bonus_musics = scan_map_bonus_music_directory(map_bonus_music_dir)
+    map_bonus_musics = await asyncio.to_thread(scan_map_bonus_music_directory, map_bonus_music_dir)
     if map_bonus_musics:
         for bonus_music in map_bonus_musics.values():
             for music_id, music_name in bonus_music.music_names.items():
@@ -362,6 +364,8 @@ def _merge_dxrating_and_lxns(
         if song_id_from_dx and song_id_from_dx in dxrating_aliases_by_song_id:
             initial_aliases.extend(dxrating_aliases_by_song_id[song_id_from_dx])
         song_model.aliases = initial_aliases
+        song_model.alias_observations = [AliasObservation(source_key="dxrating:maimai", text=text)
+                                        for text in dxrating_aliases_by_song_id.get(song_id_from_dx, [])]
 
         merged_songs[song_model.id] = song_model
 
@@ -528,7 +532,14 @@ async def _attach_lxns_yuzuchan_aliases(
             yuzuchan_aliases[song_id] = aliases
     logger.info(f"获取到 {len(yuzuchan_aliases)} 首乐曲的柚子查别名")
 
-    all_song_ids = set(lxns_aliases.keys()) | set(yuzuchan_aliases.keys())
+    all_song_ids = set(merged_songs)
+    for song_id, song in merged_songs.items():
+        for source, values in (("lxns:maimai", lxns_aliases), ("yuzuchan:maimai", yuzuchan_aliases)):
+            song.alias_observations.extend(AliasObservation(source_key=source, text=text) for text in values.get(song_id, []))
+        if isinstance(lxns_alias_data.get("aliases"), list):
+            song.alias_complete_sources.append("lxns:maimai")
+        if isinstance(yuzuchan_alias_data.get("content"), list):
+            song.alias_complete_sources.append("yuzuchan:maimai")
     for song_id in all_song_ids:
         song_info = merged_songs.get(song_id)
         if not song_info:
@@ -606,12 +617,14 @@ async def fetch_maimai_catalog(
     # dxrating aliases
     logger.info("获取 dxrating 别名数据...")
     dxrating_aliases_by_song_id: dict[str, list[str]] = {}
+    dxrating_alias_complete = False
     try:
         dxrating_alias_data = await context.get_json(
             "https://miruku.dxrating.net/api/v1/aliases",
             force_refresh=True,
         )
         if isinstance(dxrating_alias_data, list):
+            dxrating_alias_complete = True
             for item in dxrating_alias_data:
                 song_id_str = item.get("song_id")
                 alias_name = item.get("name")
@@ -631,6 +644,9 @@ async def fetch_maimai_catalog(
         music_id_to_map_id, map_id_to_map_name,
         title_to_music_id, music_id_to_map_name_from_bonus,
     )
+    if dxrating_alias_complete:
+        for song in merged_songs.values():
+            song.alias_complete_sources.append("dxrating:maimai")
     logger.info(f"数据合并完成：共 {len(merged_songs)} 首歌曲")
 
     # 5. 解析本地 Music.xml 并注入 note_counts
@@ -639,9 +655,9 @@ async def fetch_maimai_catalog(
         logger.info("步骤5: 解析本地Music XML数据")
         logger.info("=" * 50)
         music_dir = _ingame_path(context, "music")
-        music_xml_data = scan_music_directory(music_dir)
+        music_xml_data = await asyncio.to_thread(scan_music_directory, music_dir)
         if music_xml_data:
-            _enrich_with_music_xml(context, merged_songs, music_xml_data)
+            await asyncio.to_thread(_enrich_with_music_xml, context, merged_songs, music_xml_data)
         else:
             logger.info("未找到Music XML数据")
 

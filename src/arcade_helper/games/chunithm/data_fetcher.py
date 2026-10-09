@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
 from ...core.context import CatalogContext
+from ...aliases.models import AliasObservation
 from ...integrations.lxns.constants import (
     chunithm_song_list_url,
     chunithm_alias_list_url,
@@ -443,7 +445,7 @@ async def fetch_chunithm_catalog(context: CatalogContext) -> dict[int, ChuniSong
     logger.info("获取 chunithm 数据（arcade-songs + LXNS）...")
     music_xml_data: dict[int, dict] = {}
     if context.ingame_data_base_dir:
-        music_xml_data = scan_music_directory(_ingame_path(context, "music"))
+        music_xml_data = await asyncio.to_thread(scan_music_directory, _ingame_path(context, "music"))
     arcade_chuni = await _fetch_arcade_data_json(context, "chunithm")
     chuni_lxns = await context.get_json(
         chunithm_song_list_url(notes=True, base_url=context.base_url), force_refresh=True
@@ -478,6 +480,9 @@ async def fetch_chunithm_catalog(context: CatalogContext) -> dict[int, ChuniSong
                 seen.add(a.lower())
                 unique.append(a)
         song.aliases = unique
+        song.alias_observations = [AliasObservation(source_key="lxns:chunithm", text=text) for text in extra]
+        if isinstance(alias_data.get("aliases"), list):
+            song.alias_complete_sources = ["lxns:chunithm"]
 
     return merged
 

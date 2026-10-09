@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-import unicodedata
+from arcade_helper.core.song_identity import normalize_width
 
 import zhconv
 from pypinyin import Style, lazy_pinyin
@@ -88,7 +88,7 @@ def _normalize_for_matching(text: str) -> str:
     if text in _normalized_cache:
         return _normalized_cache[text]
 
-    normalized = unicodedata.normalize("NFKC", text).lower()
+    normalized = normalize_width(text).lower()
     normalized = _normalize_to_simplified(normalized)
     separators = {" ", "\t", "\n", "\r", "　", "·", "・", "･", "-", "_"}
     normalized = "".join(ch for ch in normalized if ch not in separators)
@@ -97,7 +97,7 @@ def _normalize_for_matching(text: str) -> str:
 
 
 def _ascii_tokens(text: str) -> list[str]:
-    normalized = unicodedata.normalize("NFKC", text).lower()
+    normalized = normalize_width(text).lower()
     normalized = _normalize_to_simplified(normalized)
     return re.findall(r"[a-z0-9]+", normalized)
 

@@ -10,6 +10,24 @@ from arcade_helper.storage.tortoise.models import GameProfile, ProviderAccount, 
 
 
 @pytest.mark.asyncio
+async def test_alias_index_migration_is_additive_repeatable_and_used_by_exact_lookup(tmp_path):
+    from arcade_helper.storage.tortoise import CATALOG_MODEL_MODULE, ALIAS_MODEL_MODULE, upgrade_catalog_schema
+    await Tortoise.init(db_url=f"sqlite://{tmp_path / 'catalog.sqlite3'}",
+                        modules={'models': [CATALOG_MODEL_MODULE, ALIAS_MODEL_MODULE]})
+    try:
+        await Tortoise.generate_schemas()
+        db = Tortoise.get_connection('default')
+        planned = await upgrade_catalog_schema(dry_run=True)
+        assert len(planned) == 1 and 'CREATE INDEX' in planned[0]
+        assert await upgrade_catalog_schema(dry_run=False) == planned
+        assert await upgrade_catalog_schema(dry_run=False) == []
+        plan = await db.execute_query_dict("EXPLAIN QUERY PLAN SELECT id FROM alias_evidence WHERE alias_key=? AND kind=?", ['flower', 'alias'])
+        assert any('idx_alias_evidence_key_kind' in row['detail'] for row in plan)
+    finally:
+        await Tortoise.close_connections()
+
+
+@pytest.mark.asyncio
 async def test_tortoise_account_store_v2_migration_merges_lxns_credentials(tmp_path):
     await Tortoise.init(
         db_url=f"sqlite://{tmp_path / 'accounts.sqlite3'}",
