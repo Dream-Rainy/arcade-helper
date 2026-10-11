@@ -196,6 +196,14 @@ uv build --out-dir dist
 
 ### 自定义搜索存储的可选优化接口
 
+`from arcade_helper.search import is_short_song_query` 提供 `is_short_song_query(query: str | int) -> bool`：按与搜索一致的全半角、简繁和分隔符规范化后，1–4 个字符返回 `True`，空查询返回 `False`。宿主可用它跳过短查询的推理兜底。
+
+`SongSearchService.search_candidates(query, *, game_code="maimai")` 返回同一文本规则下的 `list[SongQueryResult]`，跳过本地 embedding 和完整谱面补全。`song_data` 是文本元数据；仓库应提供 `load_search_songs()`，可选实现 `get_search_songs_by_ids()` 优化冷态精确查询；旧仓库可回退到完整数据读取。接受后可通过仓库的 `get_songs_by_ids()` 批量补全。原有 `search_song()` 默认行为不变；底层函数新增 `allow_embedding=True` 关键字参数。
+
+启用别名存储时，`TortoiseCatalogStore.text_search` 为身份解析和后台预热共享同一份修订感知的索引。`client.catalog.search_all(query, *, game_code=None, text_only=False)` 新增宿主文本模式：`text_only=True` 不进行本地 embedding 或完整谱面读取，并按宿主公开 ID 解析数字（maimai/CHUNITHM 原生 ID，其他游戏内部收录 ID）。结果仍保留作品、来源、证据和 scope。默认 `False` 保留原有 SDK 身份解析及可选本地向量行为；SDK 不调用宿主的推理服务。
+
+`search_song()` 优先返回 ID、曲名和生效别名的精确结果。短查询仅做完整目标/英文词、完整拼音缩写或完整拼音匹配；1–2 字符不扩展错字，3–4 字符允许一次编辑，不进入 BM25 或本地 embedding。长查询保留模糊、罗马音及拼音匹配；BM25 要求完整输入覆盖，且证据来自“一个曲名或一个别名＋曲师”，不能拼接多个别名/拼音字段。无需新配置，默认查询行为保持兼容。匹配分数用于排序，精确性应检查 `MatchType.EXACT_*`，不能以 `match_score == 100` 判断。
+
 搜索存储可实现 `query_title_exact(game_code, title)`，返回 `(song_id, title)` 列表，使精确曲名查询直接由数据库筛选；也可实现 `load_search_songs(game_code)`，返回仅包含 ID、曲名、作者、别名和谱面变体的 `SongData` 字典，供模糊排名和向量构建使用。此结果不是完整歌曲详情；`SongQueryResult.song_data` 对外仍返回完整详情。轻量歌曲明确设置 `aliases`（包括空列表）时直接使用该字段；未设置时继续加载独立的别名记录。
 
 `catalog.get_songs_by_ids(game_code, song_ids)` 批量返回完整的 `dict[int, SongData]`，包含难度、封面和有效别名。结果按请求 ID 的首次出现顺序排列，去除重复并省略不存在或停用的歌曲；maimai/CHUNITHM 使用游戏原生 ID，其他持久曲库使用内部歌曲 ID。自定义搜索仓库或存储可实现同签名的可选方法，搜索会在返回最终候选前批量补全详情；未实现时兼容逐首读取。未实现其他可选方法的自定义存储继续使用原有索引与完整歌曲读取方式。

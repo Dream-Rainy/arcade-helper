@@ -10,7 +10,6 @@ from arcade_helper.core.song import SongData
 from .normalization import (
     _append_choice,
     _has_cjk,
-    _normalize_to_simplified,
     _get_pinyin,
     _is_romaji_alias,
     _normalize_for_matching,
@@ -27,6 +26,8 @@ class _SearchDocument:
     confidence: float
     bm25_counts: dict[str, int]
     bm25_len: int
+    artist: str
+    aliases: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,9 +41,7 @@ class _SearchIndex:
     title_full_pinyin_norm: dict[str, list[tuple[int, str]]]
     alias_pinyin_initials_norm: dict[str, tuple[tuple[int, str], ...]]
     alias_full_pinyin_norm: dict[str, list[tuple[int, str]]]
-    romaji_alias_choices_norm: dict[str, tuple[tuple[int, str], ...]]
-    simplified_title_choices: dict[str, list[tuple[int, str]]]
-    simplified_alias_choices: dict[str, list[tuple[int, str]]]
+    romaji_alias_song_ids: dict[str, frozenset[int]]
     documents: dict[int, _SearchDocument]
     bm25_doc_freq: Counter[str]
     bm25_avg_len: float
@@ -73,6 +72,8 @@ def _build_search_document(
         confidence=1.0,
         bm25_counts=dict(Counter(bm25_terms)),
         bm25_len=len(bm25_terms),
+        artist=artist,
+        aliases=aliases,
     )
     return document, romaji_aliases
 
@@ -102,8 +103,7 @@ def _build_search_index(
     title_pinyin_initials_lists: dict[str, list[tuple[int, str]]] = {}
     title_full_pinyin_norm: dict[str, list[tuple[int, str]]] = {}
     alias_pinyin_initials_lists: dict[str, list[tuple[int, str]]] = {}
-    simplified_title_choices: dict[str, list[tuple[int, str]]] = {}
-    romaji_alias_choices_lists: dict[str, list[tuple[int, str]]] = {}
+    romaji_alias_song_ids: dict[str, set[int]] = {}
     documents: dict[int, _SearchDocument] = {}
     bm25_doc_freq: Counter[str] = Counter()
     bm25_total_len = 0
@@ -113,9 +113,16 @@ def _build_search_index(
         aliases = _unique_texts(aliases_by_song_id.get(song_id, []))
         document, romaji_aliases = _build_search_document(song_id, songs.get(song_id, ("", ()))[0], title, aliases)
         documents[song_id] = document
-        for romaji_alias in romaji_aliases:
-            romaji_norm = _normalize_for_matching(romaji_alias)
-            _append_choice(romaji_alias_choices_lists, romaji_norm, (song_id, romaji_alias))
+        for alias in aliases:
+            alias_norm = _normalize_for_matching(alias)
+            if not alias_norm:
+                continue
+            value = (song_id, alias)
+            if value not in alias_choices_norm.setdefault(alias_norm, []):
+                alias_choices_norm[alias_norm].append(value)
+                alias_freq[alias_norm] += 1
+            if alias in romaji_aliases:
+                romaji_alias_song_ids.setdefault(alias_norm, set()).add(song_id)
         bm25_doc_freq.update(document.bm25_counts.keys())
         bm25_total_len += document.bm25_len
         title_norm = _normalize_for_matching(title)
@@ -127,12 +134,8 @@ def _build_search_index(
         full_norm = _normalize_for_matching(full_py)
         if full_norm:
             _append_choice(title_full_pinyin_norm, full_norm, (song_id, title))
-        simplified_norm = _normalize_for_matching(_normalize_to_simplified(title))
-        if simplified_norm and simplified_norm != title_norm:
-            _append_choice(simplified_title_choices, simplified_norm, (song_id, title))
 
     alias_full_pinyin_norm: dict[str, list[tuple[int, str]]] = {}
-    simplified_alias_choices: dict[str, list[tuple[int, str]]] = {}
     for alias_norm, (song_id, original_alias) in ((key, value) for key, values in alias_choices_norm.items() for value in values):
         if not _has_cjk(original_alias):
             continue
@@ -145,9 +148,6 @@ def _build_search_index(
         full_norm = _normalize_for_matching(full_py)
         if full_norm:
             _append_choice(alias_full_pinyin_norm, full_norm, (song_id, original_alias))
-        simplified_norm = _normalize_for_matching(_normalize_to_simplified(original_alias))
-        if simplified_norm and simplified_norm != alias_norm:
-            _append_choice(simplified_alias_choices, simplified_norm, (song_id, original_alias))
 
     return _SearchIndex(
         songs={},
@@ -168,12 +168,10 @@ def _build_search_index(
             for key, values in alias_pinyin_initials_lists.items()
         },
         alias_full_pinyin_norm=alias_full_pinyin_norm,
-        romaji_alias_choices_norm={
-            key: tuple(values)
-            for key, values in romaji_alias_choices_lists.items()
+        romaji_alias_song_ids={
+            key: frozenset(values)
+            for key, values in romaji_alias_song_ids.items()
         },
-        simplified_title_choices=simplified_title_choices,
-        simplified_alias_choices=simplified_alias_choices,
         documents=documents,
         bm25_doc_freq=bm25_doc_freq,
         bm25_avg_len=(bm25_total_len / len(documents)) if documents else 0.0,

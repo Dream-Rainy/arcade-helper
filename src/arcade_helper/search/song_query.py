@@ -39,19 +39,18 @@ from .normalization import (
     GameCode,
     _append_choice,
     _ascii_tokens,
-    _first_meaningful_ascii_token,
     _get_pinyin,
     _has_cjk,
-    _meaningful_ascii_tokens,
     _normalize_for_matching,
     _normalize_game_code,
-    _normalize_to_simplified,
     _unique_texts,
 )
 from .scoring import (
+    BM25_MIN_QUERY_COVERAGE,
     _alias_ambiguity_penalty,
     _apply_coverage_guard,
     _bm25_query_terms,
+    _bm25_query_coverage,
     _bm25_score,
     _cap_weak_compact_match_score,
     _compute_composite_score,
@@ -60,6 +59,9 @@ from .scoring import (
     _get_symmetric_coverage,
     _has_multiple_search_terms,
     _is_short_ascii_query,
+    _literal_query_covered,
+    _short_text_score,
+    is_short_song_query,
 )
 
 logger = logging.getLogger(__name__)
@@ -164,7 +166,7 @@ class SongSearchService:
         _live_caches.add(self._cache)
         self._locks = {}
 
-    async def _run(self, method, *args, game_code="maimai", **kwargs):
+    async def _run(self, method, *args, game_code="maimai", hydrate=True, **kwargs):
         game_code = _normalize_game_code(game_code)
         async with self._locks.setdefault(game_code, asyncio.Lock()):
             token = _repository_var.set(self.repository)
@@ -175,7 +177,7 @@ class SongSearchService:
             try:
                 for _ in range(3):
                     before = await _ensure_generation(game_code)
-                    _candidate_var.set({"full": {}, "light": {}, "deferred": set()}
+                    _candidate_var.set({"full": {}, "light": {}, "deferred": set(), "hydrate": hydrate}
                                        if method in (search_song, query_song_fuzzy) else None)
                     # A source-confirmed literal bracket title must remain searchable.
                     literal = False
@@ -188,7 +190,8 @@ class SongSearchService:
                         )
                     _variant_var.set(None if literal else markers or None)
                     result = await method(*args, game_code=game_code, **kwargs)
-                    result = await _hydrate_candidates(result, game_code)
+                    if hydrate:
+                        result = await _hydrate_candidates(result, game_code)
                     if await _generation() == before:
                         return result
                     self._cache.clear(game_code)
@@ -201,6 +204,10 @@ class SongSearchService:
 
     async def search_song(self, query: str | int, *, game_code: str = "maimai") -> list[SongQueryResult]:
         return await self._run(search_song, query, game_code=game_code)
+
+    async def search_candidates(self, query: str | int, *, game_code: str = "maimai") -> list[SongQueryResult]:
+        """Text-only candidates with metadata, without local vectors or payload hydration."""
+        return await self._run(search_song, query, game_code=game_code, hydrate=False, allow_embedding=False)
 
     async def query_song_by_id(self, song_id: int, *, game_code: str = "maimai") -> SongQueryResult | None:
         return await self._run(query_song_by_id, song_id, game_code=game_code)
@@ -273,6 +280,12 @@ async def _song_by_id(song_id: int, game_code: str) -> SongData | None:
     elif candidates is not None and song_id in candidates["light"]:
         song = candidates["light"][song_id]
         candidates["deferred"].add(song_id)
+    elif candidates is not None and not candidates["hydrate"]:
+        repository = _repository()
+        batch = getattr(repository, "get_search_songs_by_ids", None)
+        songs = await batch(game_code, [song_id]) if batch else await _search_songs(game_code)
+        candidates["light"].update(songs)
+        song = songs.get(song_id)
     else:
         song = await _repository().get_song_by_id(_normalize_game_code(game_code), song_id)
         if candidates is not None:
@@ -306,7 +319,7 @@ async def _generation():
     identities = getattr(repository, "identities", None)
     if identities is None:
         identities = getattr(getattr(repository, "service", None), "identities", None)
-    return (id(repository), getattr(identities, "_db", None), value)
+    return (id(repository), getattr(identities, "_db", getattr(repository, "_db", None)), value)
 
 
 async def _ensure_generation(game_code):
@@ -638,7 +651,8 @@ async def _query_song_bm25(
         return []
 
     query_counts = Counter(query_terms)
-    scored: list[tuple[float, _SearchDocument]] = []
+    scored: list[tuple[float, float, _SearchDocument]] = []
+    effective_threshold = _get_effective_threshold(_normalize_for_matching(query), threshold)
     total_docs = len(search_index.documents)
     for document in search_index.documents.values():
         raw_score = _bm25_score(
@@ -649,20 +663,20 @@ async def _query_song_bm25(
             avg_len=search_index.bm25_avg_len,
         )
         if raw_score > 0:
-            scored.append((raw_score, document))
+            if _bm25_query_coverage(query_counts, document) < BM25_MIN_QUERY_COVERAGE:
+                continue
+            final_score = min(95.0, 60.0 + raw_score * 15.0) * document.confidence
+            if final_score >= effective_threshold:
+                scored.append((raw_score, final_score, document))
 
     if not scored:
         return []
 
     scored.sort(key=lambda item: item[0], reverse=True)
-    effective_threshold = _get_effective_threshold(_normalize_for_matching(query), threshold)
     results: list[SongQueryResult] = []
     seen_song_ids: set[int] = set()
-    for raw_score, document in scored[:BM25_TOP_CANDIDATES]:
+    for _, final_score, document in scored[:BM25_TOP_CANDIDATES]:
         if document.song_id in seen_song_ids:
-            continue
-        final_score = min(95.0, 60.0 + raw_score * 15.0) * document.confidence
-        if final_score < effective_threshold:
             continue
         song_data = await _song_by_id(document.song_id, game_code)
         if not song_data:
@@ -691,25 +705,31 @@ async def _query_song_embedding(
     query: str,
     *,
     game_code: str = "maimai",
-) -> list[SongQueryResult]:
+) -> list[SongQueryResult] | None:
     if not _truthy_env("SONG_SEARCH_EMBEDDING_ENABLED"):
-        return []
+        return None
     path = _embedding_path()
     if path is None:
-        return []
+        return None
 
     gc = _normalize_game_code(game_code)
     index = _load_embedding_index(path)
     query_vector = index.query_vectors_by_game.get(gc, {}).get(_normalize_for_matching(query))
     if query_vector is None:
-        return []
+        return None
 
     scored: list[tuple[float, int]] = []
+    validated = False
     for song_id, song_vector in index.song_vectors_by_game.get(gc, {}).items():
+        if len(query_vector) != len(song_vector):
+            continue
+        validated = True
         similarity = _cosine_similarity(query_vector, song_vector)
         score = similarity * 100.0
         if score >= _embedding_threshold():
             scored.append((score, song_id))
+    if not validated:
+        return None
 
     scored.sort(reverse=True)
     results: list[SongQueryResult] = []
@@ -734,52 +754,102 @@ async def _query_song_embedding(
     return results
 
 
-async def _query_song_romaji(
+async def _query_song_alias_fuzzy(
     query: str,
-    threshold: float = FUZZY_THRESHOLD,
+    query_norm: str,
+    search_index: _SearchIndex,
+    threshold: float,
     *,
-    game_code: str = "maimai",
+    game_code: str,
+    trace_id: str,
+) -> tuple[list[SongQueryResult], list[SongQueryResult]]:
+    effective_threshold = _get_effective_threshold(query_norm, threshold)
+    for romaji in (True, False):
+        if romaji and (not query_norm.isascii() or _is_short_ascii_query(query_norm)):
+            continue
+        choices = search_index.romaji_alias_song_ids if romaji else search_index.alias_choices_norm
+        matches = process.extract(
+            query_norm, choices.keys(),
+            scorer=fuzz.partial_ratio if romaji else _get_fuzzy_scorer(query_norm),
+            limit=MAX_RESULTS * (3 if romaji else 4), score_cutoff=effective_threshold,
+        )
+        results: list[SongQueryResult] = []
+        seen: set[int] = set()
+        for alias_norm, raw_score, _ in matches:
+            for song_id, original_alias in search_index.alias_choices_norm[alias_norm]:
+                if song_id in seen or (romaji and song_id not in choices[alias_norm]):
+                    continue
+                if not _literal_query_covered(query, original_alias):
+                    continue
+                composite, ratio, partial, dice = _compute_composite_score(query_norm, alias_norm, raw_score)
+                ambiguity = 1.0 if romaji else _alias_ambiguity_penalty(alias_norm, search_index.alias_freq.get(alias_norm, 1))
+                guard_score = _apply_coverage_guard(raw_score if romaji else composite, query_norm, alias_norm)
+                final_score = min(96.0, guard_score * 0.90) if romaji else guard_score * ALIAS_SCORE_PENALTY * ambiguity
+                if not romaji:
+                    final_score = _cap_weak_compact_match_score(final_score, query_norm, original_alias)
+                reason = "ambiguity" if ambiguity <= 0 else "coverage" if guard_score <= 0 else "threshold" if final_score < threshold else ""
+                _log_match_decision(
+                    strategy="romaji" if romaji else "alias_raw", trace_id=trace_id,
+                    query=query, candidate=original_alias, raw_score=raw_score,
+                    composite_score=composite, guard_score=guard_score, final_score=final_score,
+                    threshold=threshold, norm_query=query_norm, norm_candidate=alias_norm,
+                    coverage=_get_symmetric_coverage(query_norm, alias_norm),
+                    ratio=ratio, partial=partial, dice=dice,
+                    alias_freq=search_index.alias_freq.get(alias_norm, 1), reason=reason,
+                )
+                if reason:
+                    continue
+                song_data = await _song_by_id(song_id, game_code)
+                if not song_data:
+                    continue
+                seen.add(song_id)
+                results.append(SongQueryResult(
+                    song_id=song_id, title=_song_title(song_data, game_code),
+                    match_type=MatchType.ROMAJI if romaji else MatchType.FUZZY_ALIAS,
+                    match_score=final_score, matched_text=original_alias, song_data=song_data,
+                ))
+                if romaji and len(results) >= MAX_RESULTS:
+                    return results, []
+        if romaji and results:
+            return results, []
+        if not romaji:
+            return [], results
+    return [], []
+
+
+async def _query_song_short(
+    query_norm: str, search_index: _SearchIndex, threshold: float, *, game_code: str,
 ) -> list[SongQueryResult]:
-    query_norm = _normalize_for_matching(query)
-    if not query_norm or not query_norm.isascii() or _is_short_ascii_query(query_norm):
-        return []
+    best: dict[int, tuple[float, MatchType, str]] = {}
 
-    search_index = await _get_search_index(game_code)
-    choices = search_index.romaji_alias_choices_norm
-    if not choices:
-        return []
+    def add(song_id, score, match_type, text):
+        current = best.get(song_id)
+        if score >= threshold and (current is None or score > current[0]):
+            best[song_id] = (score, match_type, text)
 
-    matches = process.extract(
-        query_norm,
-        choices.keys(),
-        scorer=fuzz.partial_ratio,
-        limit=MAX_RESULTS * 3,
-        score_cutoff=_get_effective_threshold(query_norm, threshold),
-    )
-    results: list[SongQueryResult] = []
-    seen_song_ids: set[int] = set()
-    for alias_norm, raw_score, _ in matches:
-        for song_id, original_alias in choices[alias_norm]:
-            if song_id in seen_song_ids:
-                continue
-            guard_score = _apply_coverage_guard(raw_score, query_norm, alias_norm)
-            final_score = min(96.0, guard_score * 0.90)
-            if final_score < threshold:
-                continue
-            song_data = await _song_by_id(song_id, game_code)
-            if not song_data:
-                continue
-            seen_song_ids.add(song_id)
-            results.append(SongQueryResult(
-                song_id=song_id,
-                title=_song_title(song_data, game_code),
-                match_type=MatchType.ROMAJI,
-                match_score=final_score,
-                matched_text=original_alias,
-                song_data=song_data,
-            ))
-            if len(results) >= MAX_RESULTS:
-                return results
+    for song_id, title in search_index.index.items():
+        add(song_id, _short_text_score(query_norm, title), MatchType.FUZZY_TITLE, title)
+    for alias_norm, entries in search_index.alias_choices_norm.items():
+        for song_id, alias in entries:
+            score = _short_text_score(query_norm, alias) * ALIAS_SCORE_PENALTY
+            score *= _alias_ambiguity_penalty(alias_norm, search_index.alias_freq.get(alias_norm, 1))
+            add(song_id, score, MatchType.FUZZY_ALIAS, alias)
+    if query_norm.isascii() and len(query_norm) >= 2:
+        for choices, match_type, score in (
+            (search_index.title_pinyin_initials_norm, MatchType.PINYIN_INITIALS, 98.0),
+            (search_index.title_full_pinyin_norm, MatchType.PINYIN_FULL, 98.0),
+            (search_index.alias_pinyin_initials_norm, MatchType.PINYIN_INITIALS, 95.0 * ALIAS_SCORE_PENALTY),
+            (search_index.alias_full_pinyin_norm, MatchType.PINYIN_FULL, 95.0 * ALIAS_SCORE_PENALTY),
+        ):
+            for song_id, text in choices.get(query_norm, ()):
+                add(song_id, score, match_type, text)
+    results = []
+    for song_id, (score, match_type, text) in sorted(best.items(), key=lambda row: row[1][0], reverse=True):
+        song = await _song_by_id(song_id, game_code)
+        if song:
+            results.append(SongQueryResult(song_id, _song_title(song, game_code), match_type, score, text, song))
+        if len(results) >= MAX_RESULTS:
+            break
     return results
 
 
@@ -811,10 +881,11 @@ async def query_song_fuzzy(
         phase_stats[phase][key] += 1
 
     query_norm = _normalize_for_matching(query)
+    if is_short_song_query(query):
+        return await _query_song_short(query_norm, search_index, threshold, game_code=game_code)
     scorer = _get_fuzzy_scorer(query_norm)
     effective_threshold = _get_effective_threshold(query_norm, threshold)
     query_is_ascii = query_norm.isascii() and not _has_cjk(query_norm)
-    query_has_cjk = _has_cjk(query_norm)
 
     if trace_id:
         logger.debug(
@@ -823,60 +894,11 @@ async def query_song_fuzzy(
             f"scorer={getattr(scorer, '__name__', str(scorer))}"
         )
 
-    # ── 0. 标题 token 边界匹配（短 ASCII 查询优先保留词边界语义）──────────────
-    if _is_short_ascii_query(query_norm):
-        for song_id, title in index.items():
-            if not title:
-                continue
-            first_token = _first_meaningful_ascii_token(title)
-            tokens = _meaningful_ascii_tokens(title)
-            if query_norm == first_token:
-                strategy = "title_head_token"
-                final_score = 99.0
-            elif query_norm in tokens:
-                strategy = "title_token"
-                final_score = 93.0
-            else:
-                continue
-
-            _bump_phase(strategy, "candidates")
-            song_data = await _song_by_id(song_id, game_code)
-            if not song_data:
-                continue
-            coverage = _get_symmetric_coverage(query_norm, query_norm)
-            reason = ""
-            if final_score < threshold:
-                reason = "threshold"
-                _bump_phase(strategy, "reject_threshold")
-            else:
-                _bump_phase(strategy, "accepted")
-                seen_song_ids.add(song_id)
-                results.append(SongQueryResult(
-                    song_id=song_id,
-                    title=title,
-                    match_type=MatchType.FUZZY_TITLE,
-                    match_score=final_score,
-                    matched_text=title,
-                    song_data=song_data,
-                ))
-            _log_match_decision(
-                strategy=strategy,
-                trace_id=trace_id,
-                query=query,
-                candidate=title,
-                raw_score=final_score,
-                composite_score=final_score,
-                guard_score=final_score,
-                final_score=final_score,
-                threshold=threshold,
-                norm_query=query_norm,
-                norm_candidate=query_norm,
-                coverage=coverage,
-                ratio=final_score,
-                partial=final_score,
-                dice=0.0,
-                reason=reason,
-            )
+    romaji_results, alias_results = await _query_song_alias_fuzzy(
+        query, query_norm, search_index, threshold, game_code=game_code, trace_id=trace_id,
+    )
+    if romaji_results:
+        return romaji_results
 
     # ── 1. 标题原文匹配 ───────────────────────────────────────────────────────
     title_choices_norm = search_index.title_choices_norm
@@ -892,6 +914,8 @@ async def query_song_fuzzy(
             for song_id, title in title_choices_norm[title_norm]:
                 _bump_phase("title_raw", "candidates")
                 if song_id in seen_song_ids:
+                    continue
+                if not _literal_query_covered(query, title):
                     continue
                 song_data = await _song_by_id(song_id, game_code)
                 if not song_data:
@@ -942,132 +966,10 @@ async def query_song_fuzzy(
                 )
 
     # ── 2. 别名原文匹配 + 歧义惩罚 ───────────────────────────────────────────
-    if _is_short_ascii_query(query_norm):
-        for alias_norm, (song_id, original_alias) in ((key, value) for key, values in alias_choices_norm.items() for value in values):
-            if song_id in seen_song_ids:
-                continue
-            first_token = _first_meaningful_ascii_token(original_alias)
-            tokens = _meaningful_ascii_tokens(original_alias)
-            if query_norm == first_token:
-                strategy = "alias_head_token"
-                raw_score = 97.0
-            elif query_norm in tokens:
-                strategy = "alias_token"
-                raw_score = 94.0
-            else:
-                continue
-
-            _bump_phase(strategy, "candidates")
-            song_data = await _song_by_id(song_id, game_code)
-            if not song_data:
-                continue
-            ambiguity = _alias_ambiguity_penalty(alias_norm, alias_freq.get(alias_norm, 1))
-            final_score = raw_score * ALIAS_SCORE_PENALTY * ambiguity
-            coverage = _get_symmetric_coverage(query_norm, query_norm)
-
-            reason = ""
-            if ambiguity <= 0:
-                reason = "ambiguity"
-                _bump_phase(strategy, "reject_ambiguity")
-            elif final_score < threshold:
-                reason = "threshold"
-                _bump_phase(strategy, "reject_threshold")
-            else:
-                _bump_phase(strategy, "accepted")
-                seen_song_ids.add(song_id)
-                results.append(SongQueryResult(
-                    song_id=song_id,
-                    title=_song_title(song_data, game_code),
-                    match_type=MatchType.FUZZY_ALIAS,
-                    match_score=final_score,
-                    matched_text=original_alias,
-                    song_data=song_data,
-                ))
-            _log_match_decision(
-                strategy=strategy,
-                trace_id=trace_id,
-                query=query,
-                candidate=original_alias,
-                raw_score=raw_score,
-                composite_score=raw_score,
-                guard_score=raw_score,
-                final_score=final_score,
-                threshold=threshold,
-                norm_query=query_norm,
-                norm_candidate=query_norm,
-                coverage=coverage,
-                ratio=raw_score,
-                partial=raw_score,
-                dice=0.0,
-                alias_freq=alias_freq.get(alias_norm, 1),
-                reason=reason,
-            )
-
-    if alias_choices_norm and query_norm:
-        alias_matches = process.extract(
-            query_norm,
-            alias_choices_norm.keys(),
-            scorer=scorer,
-            limit=MAX_RESULTS * 4,
-            score_cutoff=effective_threshold,
-        )
-        for alias_norm, raw_score, _ in alias_matches:
-            _bump_phase("alias_raw", "candidates")
-            for song_id, original_alias in alias_choices_norm[alias_norm]:
-                if song_id in seen_song_ids:
-                    continue
-                song_data = await _song_by_id(song_id, game_code)
-                if not song_data:
-                    continue
-
-                composite, ratio, partial, dice = _compute_composite_score(query_norm, alias_norm, raw_score)
-                coverage = _get_symmetric_coverage(query_norm, alias_norm)
-                guard_score = _apply_coverage_guard(composite, query_norm, alias_norm)
-                ambiguity = _alias_ambiguity_penalty(alias_norm, alias_freq.get(alias_norm, 1))
-                final_score = guard_score * ALIAS_SCORE_PENALTY * ambiguity
-                final_score = _cap_weak_compact_match_score(final_score, query_norm, original_alias)
-
-                reason = ""
-                if ambiguity <= 0:
-                    reason = "ambiguity"
-                    _bump_phase("alias_raw", "reject_ambiguity")
-                elif guard_score <= 0:
-                    reason = "coverage"
-                    _bump_phase("alias_raw", "reject_coverage")
-                elif final_score < threshold:
-                    reason = "threshold"
-                    _bump_phase("alias_raw", "reject_threshold")
-                else:
-                    _bump_phase("alias_raw", "accepted")
-                    seen_song_ids.add(song_id)
-                    results.append(SongQueryResult(
-                        song_id=song_id,
-                        title=_song_title(song_data, game_code),
-                        match_type=MatchType.FUZZY_ALIAS,
-                        match_score=final_score,
-                        matched_text=original_alias,
-                        song_data=song_data,
-                    ))
-
-                _log_match_decision(
-                    strategy="alias_raw",
-                    trace_id=trace_id,
-                    query=query,
-                    candidate=original_alias,
-                    raw_score=raw_score,
-                    composite_score=composite,
-                    guard_score=guard_score,
-                    final_score=final_score,
-                    threshold=threshold,
-                    norm_query=query_norm,
-                    norm_candidate=alias_norm,
-                    coverage=coverage,
-                    ratio=ratio,
-                    partial=partial,
-                    dice=dice,
-                    alias_freq=alias_freq.get(alias_norm, 1),
-                    reason=reason,
-                )
+    for result in alias_results:
+        if result.song_id not in seen_song_ids:
+            seen_song_ids.add(result.song_id)
+            results.append(result)
 
     # ── 3. 拼音匹配（仅 ASCII 查询）──────────────────────────────────────────
     if query_is_ascii and len(query_norm) >= 2:
@@ -1288,135 +1190,6 @@ async def query_song_fuzzy(
                         reason=reason,
                     )
 
-    # ── 4. 简体化归一匹配（仅含 CJK 查询，补充召回）──────────────────────────
-    if query_has_cjk:
-        query_simplified = _normalize_for_matching(_normalize_to_simplified(query_norm))
-        simplified_scorer = _get_fuzzy_scorer(query_simplified)
-
-        simplified_title_choices = search_index.simplified_title_choices
-        if simplified_title_choices and query_simplified:
-            simp_title_matches = process.extract(
-                query_simplified,
-                simplified_title_choices.keys(),
-                scorer=simplified_scorer,
-                limit=MAX_RESULTS * 3,
-                score_cutoff=effective_threshold,
-            )
-            for simp_norm, raw_score, _ in simp_title_matches:
-                _bump_phase("title_simplified", "candidates")
-                for song_id, original_title in simplified_title_choices[simp_norm]:
-                    if song_id in seen_song_ids:
-                        continue
-                    song_data = await _song_by_id(song_id, game_code)
-                    if not song_data:
-                        continue
-                    composite, ratio, partial, dice = _compute_composite_score(query_simplified, simp_norm, raw_score)
-                    coverage = _get_symmetric_coverage(query_simplified, simp_norm)
-                    guard_score = _apply_coverage_guard(composite, query_simplified, simp_norm)
-                    final_score = min(guard_score * TITLE_SCORE_BOOST, 100.0)
-
-                    reason = ""
-                    if guard_score <= 0:
-                        reason = "coverage"
-                        _bump_phase("title_simplified", "reject_coverage")
-                    elif final_score < threshold:
-                        reason = "threshold"
-                        _bump_phase("title_simplified", "reject_threshold")
-                    else:
-                        _bump_phase("title_simplified", "accepted")
-                        seen_song_ids.add(song_id)
-                        results.append(SongQueryResult(
-                            song_id=song_id,
-                            title=original_title,
-                            match_type=MatchType.SIMPLIFIED,
-                            match_score=final_score,
-                            matched_text=original_title,
-                            song_data=song_data,
-                        ))
-                    _log_match_decision(
-                        strategy="title_simplified",
-                        trace_id=trace_id,
-                        query=query,
-                        candidate=original_title,
-                        raw_score=raw_score,
-                        composite_score=composite,
-                        guard_score=guard_score,
-                        final_score=final_score,
-                        threshold=threshold,
-                        norm_query=query_simplified,
-                        norm_candidate=simp_norm,
-                        coverage=coverage,
-                        ratio=ratio,
-                        partial=partial,
-                        dice=dice,
-                        reason=reason,
-                    )
-
-        simplified_alias_choices = search_index.simplified_alias_choices
-        if simplified_alias_choices and query_simplified:
-            simp_alias_matches = process.extract(
-                query_simplified,
-                simplified_alias_choices.keys(),
-                scorer=simplified_scorer,
-                limit=MAX_RESULTS * 4,
-                score_cutoff=effective_threshold,
-            )
-            for simp_norm, raw_score, _ in simp_alias_matches:
-                _bump_phase("alias_simplified", "candidates")
-                for song_id, original_alias in simplified_alias_choices[simp_norm]:
-                    if song_id in seen_song_ids:
-                        continue
-                    song_data = await _song_by_id(song_id, game_code)
-                    if not song_data:
-                        continue
-                    alias_norm = _normalize_for_matching(original_alias)
-                    ambiguity = _alias_ambiguity_penalty(alias_norm, alias_freq.get(alias_norm, 1))
-                    composite, ratio, partial, dice = _compute_composite_score(query_simplified, simp_norm, raw_score)
-                    coverage = _get_symmetric_coverage(query_simplified, simp_norm)
-                    guard_score = _apply_coverage_guard(composite, query_simplified, simp_norm)
-                    final_score = guard_score * ALIAS_SCORE_PENALTY * ambiguity
-
-                    reason = ""
-                    if ambiguity <= 0:
-                        reason = "ambiguity"
-                        _bump_phase("alias_simplified", "reject_ambiguity")
-                    elif guard_score <= 0:
-                        reason = "coverage"
-                        _bump_phase("alias_simplified", "reject_coverage")
-                    elif final_score < threshold:
-                        reason = "threshold"
-                        _bump_phase("alias_simplified", "reject_threshold")
-                    else:
-                        _bump_phase("alias_simplified", "accepted")
-                        seen_song_ids.add(song_id)
-                        results.append(SongQueryResult(
-                            song_id=song_id,
-                            title=_song_title(song_data, game_code),
-                            match_type=MatchType.SIMPLIFIED,
-                            match_score=final_score,
-                            matched_text=original_alias,
-                            song_data=song_data,
-                        ))
-                    _log_match_decision(
-                        strategy="alias_simplified",
-                        trace_id=trace_id,
-                        query=query,
-                        candidate=original_alias,
-                        raw_score=raw_score,
-                        composite_score=composite,
-                        guard_score=guard_score,
-                        final_score=final_score,
-                        threshold=threshold,
-                        norm_query=query_simplified,
-                        norm_candidate=simp_norm,
-                        coverage=coverage,
-                        ratio=ratio,
-                        partial=partial,
-                        dice=dice,
-                        alias_freq=alias_freq.get(alias_norm, 1),
-                        reason=reason,
-                    )
-
     for phase, stat in phase_stats.items():
         if trace_id:
             logger.debug(
@@ -1437,6 +1210,7 @@ async def search_song(
     _trace_id: str | None = None,
     *,
     game_code: str = "maimai",
+    allow_embedding: bool = True,
 ) -> list[SongQueryResult]:
     """统一乐曲搜索入口。
 
@@ -1445,10 +1219,9 @@ async def search_song(
     2. 标题精确匹配（命中即返回，不再查别名）
     3. 别名精确匹配（命中即返回）
     4. 归一化精确匹配（NFKC / 简繁 / 分隔符）
-    5. 罗马字/ASCII transliteration 别名
-    6. 模糊匹配（标题 + 别名 + 拼音 + 简体化归一）
-    7. BM25 候选召回（多词 title / artist / alias 查询）
-    8. 可选本地 embedding 兜底（默认关闭）
+    5. 模糊匹配（罗马字别名 + 标题 + 别名 + 拼音，共享归一化索引）
+    6. BM25 候选召回（完整查询覆盖检查）
+    7. 可选本地 embedding 兜底（默认关闭）
 
     Args:
         query: 查询字符串或乐曲 ID
@@ -1508,32 +1281,27 @@ async def search_song(
     if normalized_exact_results:
         return _finish(normalized_exact_results)
 
-    # 5. 罗马字/ASCII transliteration 别名
-    romaji_results = await _query_song_romaji(query_str, game_code=gc)
-    if romaji_results:
-        return _finish(romaji_results)
-
-    # 6. 模糊匹配
+    # 5. 模糊匹配（罗马字别名在共享别名匹配中优先处理）
     fuzzy_results = await query_song_fuzzy(query_str, trace_id=trace_id, game_code=gc)
     if fuzzy_results:
         return _finish(fuzzy_results)
 
-    # 7. BM25 兜底召回；多候选差距太小时先让 embedding 接管。
+    # 6. BM25 兜底召回；多候选差距太小时先让 embedding 接管。
     bm25_results: list[SongQueryResult] = []
-    if _has_multiple_search_terms(query_str):
+    if not is_short_song_query(query_str) and _has_multiple_search_terms(query_str):
         bm25_results = await _query_song_bm25(query_str, game_code=gc)
         if _bm25_is_confident(bm25_results):
             return _finish(bm25_results)
 
-    # 8. 可选本地 embedding 兜底（默认关闭）
-    embedding_results = await _query_song_embedding(query_str, game_code=gc)
+    # 7. 可选本地 embedding 兜底（默认关闭）
+    embedding_results = None if not allow_embedding or is_short_song_query(query_str) else await _query_song_embedding(query_str, game_code=gc)
     if embedding_results:
         return _finish(embedding_results)
 
-    if bm25_results:
+    if bm25_results and embedding_results is None:
         return _finish(bm25_results)
 
-    # 9. 无结果时兜底：剥离难度/版本前缀重试一次（避免误伤真实歌名）
+    # 8. 无结果时兜底：剥离难度/版本前缀重试一次（避免误伤真实歌名）
     if _prefix_retry and isinstance(query, str):
         stripped_query = _strip_query_prefix_for_retry(query_str)
         if stripped_query:
@@ -1546,6 +1314,7 @@ async def search_song(
                 _prefix_retry=False,
                 _trace_id=trace_id,
                 game_code=gc,
+                allow_embedding=allow_embedding,
             )
             return _finish(retry_results)
 

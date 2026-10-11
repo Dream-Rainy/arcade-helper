@@ -68,6 +68,24 @@ async def import_song(store, game, *, title="Shared Song", artist="Artist", alia
     return report.song_ids[native]
 
 
+async def test_text_mode_reuses_prewarm_and_invalidates_alias_metadata(catalog, monkeypatch):
+    store, aliases = catalog
+    sid = await import_song(store, "sdvx", title="Transcend Lights", aliases=["shared nickname"])
+    await store.text_search._warm_search_index("sdvx")
+    index = store.text_search._cache.indexes[("sdvx", None)]
+    full_reads = []
+    original = store.get_songs_by_ids
+    async def full(*args):
+        full_reads.append(args)
+        return await original(*args)
+    monkeypatch.setattr(store, "get_songs_by_ids", full)
+    assert (await aliases.search_all("Transcend Light", text_only=True)).candidates[0].game_song_id == sid
+    assert index is store.text_search._cache.indexes[("sdvx", None)] and not full_reads
+    await import_song(store, "sdvx", title="Transcend Lights", aliases=["changed nickname"])
+    assert not (await aliases.search_all("shared nickname", text_only=True)).candidates
+    assert (await aliases.search_all("changed nickname", text_only=True)).candidates[0].game_song_id == sid
+
+
 async def approve(service, operation, payload, *, actor=1, reviewer=10, key=None):
     request = await service.submit(actor_id=actor, operation=operation, payload=payload,
                                    idempotency_key=key or f"{operation}-{await AliasRequest.all().count()}")
@@ -283,6 +301,34 @@ async def test_shared_alias_inference_variants_and_reversible_association(catalo
     await approve(service, "UNBLOCK_ALIAS", {"game_song_id": chuni, "text": "Shared Nick"})
     assert {c.game_song_id for c in (await service.resolve_alias("Shared Nick")).candidates} == {chuni}
     await assert_text_projection_matches_evidence(store)
+
+
+async def test_cross_game_search_rejects_artist_only_hit_in_unrelated_query(catalog):
+    store, service = catalog
+    for game in ("maimai", "chunithm"):
+        records = []
+        for index in range(25):
+            song = SongData(id=index + 1, title=f"Example Track {index}", artist="Teto" if index < 2 else "Other",
+                            alias_observations=[AliasObservation(source_key=f"lxns:{game}", text="做眼保健操")] if index == 2 else [])
+            records.append(CatalogRecord(song, song.model_dump(mode="json"), str(song.id)))
+        await store.import_records(game, records, provider="catalog", namespace="native", complete=False)
+
+    assert not (await service.search_all("teto做眼保健操")).candidates
+    supported = await service.search_all("teto example")
+    assert {candidate.game_code for candidate in supported.candidates} == {"maimai", "chunithm"}
+    assert {candidate.title for candidate in supported.candidates} == {"Example Track 0", "Example Track 1"}
+    assert {candidate.title for candidate in (await service.search_all("做眼保健操")).candidates} == {"Example Track 2"}
+
+
+async def test_cross_game_short_queries_and_incoherent_aliases(catalog):
+    store, service = catalog
+    for game in ("maimai", "chunithm"):
+        await import_song(store, game, title="测试", aliases=["红苹果", "蓝香蕉", "teto做眼保健操", "🍥"])
+    for query in ("shi", "测", "测式", "红苹果蓝香蕉"):
+        assert not (await service.search_all(query)).candidates
+    for query in ("cs", "测试", "teto做眼保健操", "🍥"):
+        result = await service.search_all(query)
+        assert {candidate.game_code for candidate in result.candidates} == {"maimai", "chunithm"}
 
 
 async def test_review_authorization_idempotency_concurrency_and_rollback(catalog, monkeypatch):

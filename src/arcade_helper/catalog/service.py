@@ -287,8 +287,8 @@ class SongCatalogService:
     def _aliases_enabled(self) -> bool:
         return bool(self.identities is not None and getattr(self.identities, "enable_aliases", False))
 
-    async def search_all(self, query, *, game_code=None):
-        return await self.aliases.search_all(query, game_code=game_code)
+    async def search_all(self, query, *, game_code=None, text_only=False):
+        return await self.aliases.search_all(query, game_code=game_code, text_only=text_only)
 
     async def resolve_alias(self, query, *, game_code=None):
         return await self.aliases.resolve_alias(query, game_code=game_code)

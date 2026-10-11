@@ -32,6 +32,16 @@ class TortoiseCatalogStore:
         self.auto_match = auto_match
         self._song_cache = {}
         self._cache_lock = asyncio.Lock()
+        self._text_search = None
+        self._search_songs_cache = {}
+
+    @property
+    def text_search(self):
+        """Shared, revision-aware internal-ID text index for this store."""
+        if self._text_search is None:
+            from arcade_helper.search import SongSearchService
+            self._text_search = SongSearchService(self)
+        return self._text_search
 
     @property
     def _db(self):
@@ -383,17 +393,36 @@ class TortoiseCatalogStore:
         return dict(await GameSong.filter(game_code=game_code, active=True).using_db(self._db).values_list("id", "title"))
 
     async def load_search_songs(self, game_code: str) -> dict[int, SongData]:
+        for _ in range(3):
+            generation = (self._db, await self.get_revision())
+            cached = self._search_songs_cache.get(game_code)
+            if cached is not None and cached[0] == generation:
+                return cached[1]
+            songs = await self.get_search_songs_by_ids(game_code)
+            if (self._db, await self.get_revision()) == generation:
+                self._search_songs_cache[game_code] = (generation, songs)
+                return songs
+        raise CatalogConflictError("Catalog changed repeatedly while loading metadata; retry")
+
+    async def get_search_songs_by_ids(self, game_code: str, song_ids: list[int] | None = None) -> dict[int, SongData]:
         """Text-only metadata for alias-enabled catalogs; legacy JSON fallback."""
+        cached = self._search_songs_cache.get(game_code)
+        if song_ids is not None and cached is not None and cached[0] == (self._db, await self.get_revision()):
+            return {sid: cached[1][sid] for sid in song_ids if sid in cached[1]}
         if not self.enable_aliases:
             # Legacy imports keep aliases only in JSON until alias storage is enabled.
-            return await self._cached_songs(game_code)
-        rows = await GameSong.filter(game_code=game_code, active=True).using_db(self._db).values(
-            "id", "title", "artist", "chart_variant"
+            songs = await self._cached_songs(game_code)
+            return songs if song_ids is None else {sid: songs[sid] for sid in song_ids if sid in songs}
+        query = GameSong.filter(game_code=game_code, active=True).using_db(self._db)
+        if song_ids is not None:
+            query = query.filter(id__in=song_ids)
+        rows = await query.values(
+            "id", "title", "artist", "chart_variant", "work_id", "game_code"
         )
-        songs = {r["id"]: SongData(**r) for r in rows}
+        songs = {r["id"]: SongData(**{**r, "game_song_id": r["id"], "work_id": str(r["work_id"])}) for r in rows}
         if self.enable_aliases:
             from .alias_store import TortoiseAliasStore
-            projection = await TortoiseAliasStore(self)._alias_texts(game_code)
+            projection = await TortoiseAliasStore(self)._alias_texts(game_code, song_ids=list(songs))
             for sid, song in songs.items():
                 song.aliases = projection[sid]
         return songs

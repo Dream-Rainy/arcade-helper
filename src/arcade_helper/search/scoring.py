@@ -7,6 +7,7 @@ from collections.abc import Mapping
 import math
 
 from rapidfuzz import fuzz
+from rapidfuzz.distance import Levenshtein
 
 from .constants import (
     BM25_B,
@@ -24,9 +25,45 @@ from .normalization import (
     _has_cjk,
     _is_cjk_char,
     _is_meaningful_ascii_token,
+    _meaningful_ascii_tokens,
     _normalize_for_matching,
     _search_terms,
 )
+
+BM25_MIN_QUERY_COVERAGE = 0.6
+
+
+def is_short_song_query(query: str | int) -> bool:
+    """Whether a normalized query needs text-only matching (1–4 characters)."""
+    return 0 < len(_normalize_for_matching(str(query))) <= 4
+
+
+def _short_text_score(query: str, candidate: str) -> float:
+    normalized = _normalize_for_matching(candidate)
+    if query == normalized:
+        return 100.0
+    if len(query) <= 2:
+        return 0.0
+    targets = _meaningful_ascii_tokens(candidate) if query.isascii() and query.isalnum() else [normalized]
+    for index, target in enumerate(targets):
+        if query == target:
+            return 97.0 if index == 0 else 93.0
+    if len(query) >= 3 and any(
+        abs(len(query) - len(target)) <= 1 and Levenshtein.distance(query, target, score_cutoff=1) <= 1
+        for target in targets
+    ):
+        return 95.0
+    return 0.0
+
+
+def _literal_query_covered(query: str, candidate: str) -> bool:
+    targets = _ascii_tokens(candidate)
+    return all(any(
+        term == target
+        or (len(term) > 4 and target.startswith(term))
+        or (len(term) >= 3 and Levenshtein.distance(term, target, score_cutoff=1) <= 1)
+        for target in targets
+    ) for term in _meaningful_ascii_tokens(query))
 
 
 def _bm25_query_terms(query: str) -> list[str]:
@@ -35,6 +72,27 @@ def _bm25_query_terms(query: str) -> list[str]:
 
 def _has_multiple_search_terms(query: str) -> bool:
     return len(set(_bm25_query_terms(query))) >= 2
+
+
+def _bm25_query_coverage(query_counts: Mapping[str, int], document: _SearchDocument) -> float:
+    # Keep unseen terms in the denominator so a rare word cannot validate an unrelated sentence.
+    if any(term.isascii() and document.bm25_counts.get(term, 0) <= 0 for term in query_counts):
+        return 0.0
+    total = sum(query_counts.values())
+    matched = sum(count for term, count in query_counts.items() if document.bm25_counts.get(term, 0) > 0)
+    if not total or matched / total < BM25_MIN_QUERY_COVERAGE:
+        return 0.0
+    artist_terms = set(_search_terms(document.artist))
+    best = 0.0
+    for text in (document.title, *document.aliases):
+        terms = artist_terms.union(_search_terms(text))
+        if any(term.isascii() and term not in terms for term in query_counts):
+            continue
+        coverage = sum(count for term, count in query_counts.items() if term in terms) / total
+        best = max(best, coverage)
+        if best == 1.0:
+            break
+    return best
 
 
 def _bm25_score(

@@ -338,10 +338,9 @@ class TortoiseAliasStore:
                 return deepcopy(result)
         raise AliasConflictError("Catalog changed repeatedly during alias lookup")
 
-    async def _search(self, query, game_code=None, *, aliases_only=False):
-        from arcade_helper.search import SongSearchService
+    async def _search(self, query, game_code=None, *, aliases_only=False, text_only=False):
         normalized = alias_key(str(query))
-        key = (str(query), game_code, aliases_only)
+        key = (str(query), game_code, aliases_only, text_only)
         for _ in range(3):
             before = await self.catalog.get_revision()
             self._read_generation(before)
@@ -359,7 +358,11 @@ class TortoiseAliasStore:
             for song in eligible:
                 evidence = [e for e in projection.get(song.id, []) if e["alias_key"] == normalized and (not aliases_only or e["kind"] == "alias")]
                 title_hit = not aliases_only and titles[song.id] == normalized
-                id_hit = not aliases_only and str(query) in {str(song.id), native_ids.get(song.id)}
+                # Host text queries use native IDs for the two LXNS games.
+                public_id = native_ids.get(song.id) if text_only and song.game_code in {"maimai", "chunithm"} else str(song.id)
+                id_query = str(int(normalized)) if text_only and normalized.isdecimal() else str(query)
+                ids = {public_id} if text_only else {public_id, native_ids.get(song.id)}
+                id_hit = not aliases_only and id_query in ids
                 if evidence or title_hit or id_hit:
                     games = tuple(sorted({e["origin_game"] for e in evidence if e["kind"] == "alias" and e["origin_game"]}))
                     candidates.append(AliasCandidate(song.id, str(song.work_id), song.game_code, song.title,
@@ -369,14 +372,20 @@ class TortoiseAliasStore:
                         chart_variant=tuple(song.chart_variant) if song.chart_variant is not None else None))
             exact = bool(candidates)
             if not candidates and not aliases_only:
-                search = getattr(self, "_search_service", None)
-                if search is None:
-                    search = self._search_service = SongSearchService(self.catalog)
+                search = self.catalog.text_search
                 permitted = {s.id for s in eligible}
                 songs_by_id = {s.id: s for s in eligible}
                 matches = []
-                for game in sorted({s.game_code for s in eligible}):
-                    for match in await search.search_song(query, game_code=game):
+                semaphore = asyncio.Semaphore(2)
+                async def find(game):
+                    async with semaphore:
+                        method = search.search_candidates if text_only else search.search_song
+                        # Native numeric IDs were already resolved above; don't reinterpret them as internal IDs.
+                        if text_only and game in {"maimai", "chunithm"} and str(query).isdecimal():
+                            return game, []
+                        return game, await method(query, game_code=game)
+                for game, results in await asyncio.gather(*(find(game) for game in sorted({s.game_code for s in eligible}))):
+                    for match in results:
                         if match.song_id not in permitted:
                             continue
                         matches.append((game, match))
@@ -388,7 +397,8 @@ class TortoiseAliasStore:
                     games = tuple(sorted({e["origin_game"] for e in evidence if e["origin_game"]}))
                     candidates.append(AliasCandidate(song.id, str(song.work_id), game, song.title, match.matched_text,
                         match.match_type.value, match.match_score, games, tuple(e["id"] for e in evidence),
-                        shared=bool(games and game not in games), chart_variant=tuple(song.chart_variant) if song.chart_variant is not None else None))
+                        shared=bool(games and game not in games), scope="work" if any(e["scope"] == "work" for e in evidence) else "game_song",
+                        chart_variant=tuple(song.chart_variant) if song.chart_variant is not None else None))
             preferences = {}
             for work in {c.work_id for c in candidates}:
                 available = {s.game_code for s in rows if str(s.work_id) == work}
@@ -409,8 +419,8 @@ class TortoiseAliasStore:
                 return result
         raise AliasConflictError("Catalog changed repeatedly during resolution")
 
-    async def search_all(self, query, *, game_code=None):
-        return await self._search(query, game_code)
+    async def search_all(self, query, *, game_code=None, text_only=False):
+        return await self._search(query, game_code, text_only=text_only)
 
     async def resolve_alias(self, query, *, game_code=None):
         return await self._search(query, game_code, aliases_only=True)

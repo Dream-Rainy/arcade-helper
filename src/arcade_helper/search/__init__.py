@@ -1,6 +1,7 @@
 """Provider-independent song search."""
 
 from .models import MatchType, SongQueryResult
+from .scoring import is_short_song_query
 from .song_query import (
     SongSearchNotConfiguredError,
     SongSearchRepository,
@@ -20,6 +21,7 @@ from .song_query import (
 __all__ = [
     "MatchType",
     "SongQueryResult",
+    "is_short_song_query",
     "SongSearchNotConfiguredError",
     "SongSearchRepository",
     "SongSearchService",
