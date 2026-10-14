@@ -412,6 +412,7 @@ class SongCatalogService:
         if not self._aliases_enabled():
             raise StorageNotConfiguredError("Enable aliases on a persistent catalog store first")
         unavailable = []
+        missing = []
         if game_code is not None:
             game_code = str(game_code).strip().lower()
             await self._ensure_generic_catalog(game_code)
@@ -423,9 +424,12 @@ class SongCatalogService:
                 if state != "ready":
                     unavailable.append(game)
                 if state == "missing":
-                    self._start_catalog_task(game)
+                    missing.append(game)
         result = (await self.aliases.resolve_alias(query, game_code=game_code) if aliases_only else
                   await self.aliases.search_all(query, game_code=game_code, text_only=text_only))
+        # Finish fact reads before imports can occupy the shared SQLite connection.
+        for game in missing:
+            self._start_catalog_task(game)
         if unavailable and not result.candidates:
             raise CatalogSyncError(f"Catalogs initializing or unavailable: {', '.join(unavailable)}; retry or await prepare_catalogs()")
         if unavailable:
@@ -494,11 +498,11 @@ class SongCatalogService:
         """Return full songs in requested ID order, omitting missing/inactive IDs.
 
         Native games use public native IDs; older stores fall back to single reads.
+        Known-ID hydration does not prepare catalogs or scan their full indexes.
         """
         ids = list(dict.fromkeys(song_ids))
         if not ids:
             return {}
-        await self._ensure_generic_catalog(game_code)
         store = self._read_store(game_code)
         batch = getattr(store, "get_songs_by_ids", None)
         for _ in range(3):

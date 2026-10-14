@@ -86,6 +86,48 @@ async def test_text_mode_reuses_prewarm_and_invalidates_alias_metadata(catalog, 
     assert (await aliases.search_all("changed nickname", text_only=True)).candidates[0].game_song_id == sid
 
 
+async def test_known_id_batches_remain_bounded_without_catalog_preparation(catalog, monkeypatch):
+    from arcade_helper import ArcadeHelperClient
+    from arcade_helper.core.song import SongSheet
+
+    store, _ = catalog
+    songs = [SongData(id=i, title=f"Batch {i}", artist="Artist", aliases=[f"Nick {i}"],
+                     image_name=f"{i}.jpg", difficulties={"standard": [
+                         SongSheet(type="standard", difficulty="master", level="15")
+                     ]}) for i in range(5)]
+    report = await store.import_records("sdvx", [
+        CatalogRecord(song, song.model_dump(mode="json"), str(song.id)) for song in songs
+    ], provider="catalog", namespace="native")
+    ids = list(report.song_ids.values())
+    async def no_remote_reads(*args, **kwargs):
+        pytest.fail("Known-ID details must not fetch a remote catalog")
+    client = ArcadeHelperClient(http_get_json=no_remote_reads, catalog_store=store)
+    await client.lifecycle.start()
+    queries = []
+    for name in ("execute_query", "execute_query_dict"):
+        original = getattr(store._db, name)
+        async def counted(sql, *args, _original=original, **kwargs):
+            queries.append(sql)
+            return await _original(sql, *args, **kwargs)
+        monkeypatch.setattr(store._db, name, counted)
+    try:
+        two = await client.catalog.get_songs_by_ids("sdvx", ids[:2])
+        cold_count = len(queries)
+        assert list(two) == ids[:2]
+        queries.clear()
+        requested = [ids[-1], *ids, ids[0], 99999999]
+        batch = await client.catalog.get_songs_by_ids("sdvx", requested)
+        assert len(queries) == cold_count
+        assert list(batch) == [ids[-1], *ids[:-1]]
+        for i, sid in enumerate(ids):
+            assert batch[sid].image_name == f"{i}.jpg"
+            assert batch[sid].aliases == [f"Nick {i}"]
+            assert batch[sid].difficulties["standard"][0].level == "15"
+        assert await client.catalog.get_songs_by_ids("missing", [99999999]) == {}
+    finally:
+        await client.lifecycle.stop()
+
+
 async def approve(service, operation, payload, *, actor=1, reviewer=10, key=None):
     request = await service.submit(actor_id=actor, operation=operation, payload=payload,
                                    idempotency_key=key or f"{operation}-{await AliasRequest.all().count()}")
@@ -158,6 +200,8 @@ async def test_catalog_preparation_singleflight_failures_and_shutdown(catalog, t
     store, _ = catalog
     entered, release, waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
     waiting_release = asyncio.Event()
+    global_read_finished = asyncio.Event()
+    background_readiness = []
     calls = []
     clock = [100.0]
     broken = [True]
@@ -170,6 +214,8 @@ async def test_catalog_preparation_singleflight_failures_and_shutdown(catalog, t
                 {"gameCode": "maimai", "dataSourceUrl": "https://fixture.test/maimai"},
                 {"gameCode": "any", "dataSourceUrl": "https://fixture.test/any", "isHidden": True}]
         game = url.split("/")[-2]
+        if game != "gitadora":
+            background_readiness.append(global_read_finished.is_set())
         if game == "gitadora":
             entered.set()
             await release.wait()
@@ -194,9 +240,11 @@ async def test_catalog_preparation_singleflight_failures_and_shutdown(catalog, t
         assert results[0][0].song_id == results[1][0].song_id
         assert calls.count("https://fixture.test/gitadora/data.json") == 1
         result = await client.catalog.search_all(titles["gitadora"], text_only=True)
+        global_read_finished.set()
         assert result.candidates and result.inferred_game is None
         assert set(result.unavailable_games) == {"popn", "sdvx"}
         await asyncio.wait_for(waiting.wait(), 2)
+        assert background_readiness and all(background_readiness)
         with pytest.raises(CatalogSyncError, match="initializing or unavailable"):
             await client.catalog.search_all(titles["popn"])
         with pytest.raises(CatalogSyncError):
