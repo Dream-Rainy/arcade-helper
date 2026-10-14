@@ -246,10 +246,12 @@ class ArcadeHelperLifecycle:
         if self._client._state in {"stopped", "closed"}:
             return
         if self._client._state == "created":
+            await self._client.catalog.close()
             self._client._state = "stopped"
             return
 
         self._client._state = "stopping"
+        await self._client.catalog.close()
         self._client._state = "stopped"
 
 

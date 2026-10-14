@@ -11,7 +11,7 @@ from typing import Any
 from tortoise.expressions import F
 from tortoise.transactions import in_transaction
 
-from arcade_helper.catalog.importer import CatalogImportReport, CatalogRecord, content_key, prepare_arcade_catalog
+from arcade_helper.catalog.importer import CatalogImportReport, CatalogRecord, arcade_record_key, content_key, prepare_arcade_catalog
 from arcade_helper.core.errors import CatalogSyncError, StorageNotConfiguredError
 from arcade_helper.core.song import SongData
 from arcade_helper.aliases.models import alias_key
@@ -53,6 +53,28 @@ class TortoiseCatalogStore:
         if row is None:
             raise StorageNotConfiguredError("Run initialize_catalog_storage() before persistent catalog use")
         return row.revision
+
+    async def _migrate_reference_key(self, db, ref, key, external_key):
+        old_key = ref.external_key
+        if self.enable_aliases:
+            from .alias_models import AliasEvidence
+            from .alias_store import TortoiseAliasStore
+            for evidence in await AliasEvidence.filter(reference_id=ref.id).using_db(db):
+                locator = (external_key if evidence.kind == "title" and evidence.source_record_key == old_key else
+                           content_key([external_key, evidence.alias_key]) if evidence.source_record_key == content_key([old_key, evidence.alias_key]) else None)
+                if locator is None:
+                    continue
+                digest = content_key([evidence.source_id, locator, evidence.anchor_id,
+                                      evidence.alias_key, evidence.scope, evidence.kind])
+                if await AliasEvidence.filter(evidence_key=digest).exclude(id=evidence.id).using_db(db).exists():
+                    raise CatalogConflictError("Evidence collision while migrating source identity")
+                evidence.source_record_key, evidence.evidence_key = locator, digest
+                evidence.version += 1
+                await evidence.save(using_db=db, update_fields=["source_record_key", "evidence_key", "version"])
+            await TortoiseAliasStore(self).event(db, "migrate_source_identity", before={"external_key": old_key},
+                                               after={"reference_id": ref.id, "external_key": external_key})
+        ref.reference_key, ref.external_key = key, external_key
+        await ref.save(using_db=db, update_fields=["reference_key", "external_key"])
 
     async def import_arcade_catalog(
         self, game_code: str, payload: dict, *, provider: str = "arcade_songs",
@@ -103,21 +125,73 @@ class TortoiseCatalogStore:
             if expected_sync_version is not None and sync_version != expected_sync_version:
                 raise CatalogConflictError("Dataset changed during fetch; refetch and retry")
             report = CatalogImportReport(game_code, revision, dry_run=dry_run, invalid=list(invalid or []), sync_version=sync_version)
+            report.source_record_count = (len(raw_payload["songs"]) if isinstance(raw_payload, dict) and isinstance(raw_payload.get("songs"), list)
+                                          else len(records))
+            resolutions = dict(previous.resolutions or {}) if previous else {}
             refs = await SongReference.filter(
                 provider=provider, namespace=namespace, game_code=game_code,
             ).using_db(db).only("id", "reference_key", "external_key", "key_kind", "identity_material", "present", "game_song_id")
             by_key = {ref.reference_key: ref for ref in refs}
             by_normalized_identity = defaultdict(list)
+            by_locator = defaultdict(list)
+            legacy_locators = {}
+            if any(record.source_record_key is not None for record in records):
+                legacy_ids = [ref.id for ref in refs if ref.key_kind == "derived" and "source_record_key" not in ref.identity_material]
+                for offset in range(0, len(legacy_ids), 256):
+                    for sid, raw in await SongReference.filter(id__in=legacy_ids[offset:offset + 256]).using_db(db).values_list("id", "raw_payload"):
+                        legacy_locators[sid] = arcade_record_key(raw)
+            def base_key(identity):
+                material = dict(identity)
+                material.pop("source_record_key", None)
+                material["title"] = normalize_width(material["title"]).strip()
+                return content_key(material)
+            def compatible(old, new):
+                return (normalize_width(old["title"]).strip() == new["title"]
+                        and (old.get("artist") is None or old.get("artist") == new.get("artist"))
+                        and all(old.get(field) == new.get(field) for field in ("chart_variant", "music_variant")))
             for ref in refs:
-                if ref.key_kind == "derived" and ref.present:
-                    identity = dict(ref.identity_material)
-                    title = normalize_width(identity["title"])
-                    identity["title"] = title.strip() or title
-                    by_normalized_identity[content_key(identity)].append(ref)
+                if ref.key_kind == "derived":
+                    locator = ref.identity_material.get("source_record_key", legacy_locators.get(ref.id))
+                    if locator is not None:
+                        by_locator[locator].append(ref)
+                    if ref.present and "source_record_key" not in ref.identity_material:
+                        by_normalized_identity[base_key(ref.identity_material)].append(ref)
             grouped: dict[str, list[CatalogRecord]] = defaultdict(list)
             for record in records:
+                decision = resolutions.get(record.external_key, {})
+                if decision.get("observations", {}).get(record.selector, {}).get("decision") == "reject":
+                    report.rejected_record_count += 1
+                    continue
                 grouped[content_key([provider, namespace, game_code, record.key_kind, record.external_key])].append(record)
-            missing = [ref for ref in refs if ref.present and ref.reference_key not in grouped]
+            report.duplicate_record_count = len(records) - len({(r.key_kind, r.external_key, r.selector) for r in records})
+            incoming_bases = defaultdict(set)
+            source_observations = defaultdict(set)
+            for key, group in grouped.items():
+                incoming_bases[base_key(group[0].identity)].add(key)
+                for record in group:
+                    if record.source_record_key is not None:
+                        source_observations[record.source_record_key].add(record.selector)
+            matches = {}
+            for key, group in grouped.items():
+                record = group[0]
+                ref, reason = by_key.get(key), None
+                if ref is None and record.key_kind == "derived":
+                    candidates = by_locator.get(record.source_record_key, []) if record.source_record_key is not None else []
+                    if not candidates:
+                        candidates = [old for old in by_normalized_identity.get(base_key(record.identity), [])
+                                      if legacy_locators.get(old.id) in {None, record.source_record_key}]
+                        if candidates and len(incoming_bases[base_key(record.identity)]) > 1:
+                            reason = "legacy_identity_ambiguous"
+                    if len(candidates) == 1 and not reason:
+                        ref = candidates[0]
+                        if not compatible(ref.identity_material, record.identity):
+                            reason = "source_record_changed"
+                    elif len(candidates) > 1:
+                        reason = "source_identity_collision"
+                matches[key] = (ref, reason)
+            matched_ids = {ref.id for ref, reason in matches.values() if ref is not None and reason is None}
+            missing = [ref for ref in refs if ref.present and ref.reference_key not in grouped and ref.id not in matched_ids]
+            held_ids = set()
             affected: set[int] = set()
             changed = False
             grouped_items = list(grouped.items())
@@ -125,39 +199,39 @@ class TortoiseCatalogStore:
                 batch = grouped_items[offset:offset + 256]
                 batch_ids = set()
                 for key, group in batch:
-                    ref = by_key.get(key)
+                    ref = matches[key][0]
                     if ref is not None:
                         batch_ids.add(ref.id)
-                    elif group[0].key_kind == "derived":
-                        matches = by_normalized_identity.get(content_key(group[0].identity), [])
-                        if len(matches) == 1:
-                            batch_ids.add(matches[0].id)
                 previous_payloads = {r["id"]: r for r in await SongReference.filter(id__in=batch_ids).using_db(db).values("id", "payload", "raw_payload", "present")} if batch_ids else {}
                 for key, group in batch:
                     record = group[0]
-                    if previous and (previous.resolutions or {}).get(record.external_key, {}).get("decision") == "reject":
-                        continue
-                    ref = by_key.get(key)
+                    ref, match_reason = matches[key]
                     identity = record.identity
-                    width_matches = by_normalized_identity.get(content_key(identity), []) if ref is None and record.key_kind == "derived" else []
-                    width_migration = len(width_matches) == 1
-                    if width_migration:
-                        ref = width_matches[0]
-                    reason = None
+                    disposition = resolutions.get(record.external_key, resolutions.get(ref.external_key if ref else content_key({k: v for k, v in identity.items() if k != "source_record_key"}), {}))
+                    disposition = disposition.get("observations", {}).get(record.selector, disposition)
+                    if disposition.get("decision") == "reject":
+                        report.rejected_record_count += len(group)
+                        continue
+                    migration = ref is not None and ref.reference_key != key
+                    approved = disposition.get("decision") in {"new", "bind"} and ref is not None
+                    reason = match_reason
                     if any(item.raw != record.raw or item.identity != identity for item in group[1:]):
                         reason = "duplicate_identity"
-                    elif len(width_matches) > 1:
-                        reason = "width_identity_collision"
-                    elif ref is not None and not width_migration and (ref.external_key != record.external_key or ref.key_kind != record.key_kind):
+                    elif record.source_record_key is not None and len(source_observations[record.source_record_key]) > 1 and not approved:
+                        reason = "duplicate_source_record_key"
+                    elif ref is not None and not migration and (ref.external_key != record.external_key or ref.key_kind != record.key_kind):
                         raise CatalogConflictError("Source key collision")
-                    elif ref is not None and not width_migration and record.key_kind == "derived" and ref.identity_material != identity:
+                    elif ref is not None and not migration and record.key_kind == "derived" and ref.identity_material != identity:
                         raise CatalogConflictError("Derived identity collision")
                     elif ref is not None and any(
                         ref.identity_material.get(field) != identity[field]
                         for field in ("chart_variant", "music_variant")
                     ):
                         reason = "variant_changed"
-                    elif record.key_kind == "derived" and (identity["artist"] is None or identity["chart_variant"] is None):
+                    elif (approved and (disposition.get("target_id", ref.game_song_id) != ref.game_song_id
+                                        or not compatible(disposition.get("identity", ref.identity_material), identity))):
+                        reason = "approved_mapping_changed"
+                    elif record.key_kind == "derived" and identity["chart_variant"] is None and not approved:
                         reason = "incomplete_identity"
                     elif ref is not None and not ref.present and record.key_kind == "derived":
                         reason = "retired_identity"
@@ -167,15 +241,31 @@ class TortoiseCatalogStore:
                         for old in missing
                     ):
                         reason = "possible_rename"
+                    if (ref is not None and record.source_record_key is not None
+                            and len(incoming_bases[base_key(identity)]) > 1
+                            and previous_payloads[ref.id]["raw_payload"].get("version") is not None
+                            and record.raw.get("version") is not None
+                            and previous_payloads[ref.id]["raw_payload"]["version"] != record.raw["version"]):
+                        reason = "source_record_changed"
                     if reason:
-                        report.pending.append({"external_key": record.external_key, "title": record.song.title, "reason": reason})
+                        related = {old.id for old in missing if (ref is not None and old.id == ref.id)
+                                   or old.identity_material["title"] == identity["title"]
+                                   or (identity["artist"] and old.identity_material.get("artist") == identity["artist"])}
+                        held_ids.update(related)
+                        report.pending_record_count += len(group)
+                        report.pending_reasons[reason] = report.pending_reasons.get(reason, 0) + len(group)
+                        report.pending.append({"external_key": record.external_key, "title": record.song.title, "reason": reason,
+                                               "record_count": len(group), "related_reference_ids": sorted(related),
+                                               "records": [{"source_record_key": item.source_record_key, "record_selector": item.selector} for item in group]})
                         continue
-                    if width_migration:
-                        # A unique width-only change keeps its existing GameSong ID and evidence anchors.
+                    report.processed_record_count += len(group)
+                    if migration:
                         missing = [old for old in missing if old.id != ref.id]
                         if not dry_run:
-                            ref.reference_key, ref.external_key = key, record.external_key
-                            await ref.save(using_db=db, update_fields=["reference_key", "external_key"])
+                            if ref.external_key in resolutions:
+                                resolutions[record.external_key] = {**resolutions.pop(ref.external_key), "identity": identity}
+                            await self._migrate_reference_key(db, ref, key, record.external_key)
+                        changed = True
                     payload = record.song.model_dump(mode="json")
                     for field in ("id", "game_song_id", "work_id", "game_code"):
                         payload.pop(field, None)
@@ -192,7 +282,7 @@ class TortoiseCatalogStore:
                         song = await GameSong.create(
                             work=work, game_code=game_code, title=record.song.title,
                             artist=record.song.artist, chart_variant=identity["chart_variant"],
-                            catalog_payload=payload, using_db=db,
+                            catalog_payload=payload, edition_key=content_key(record.source_record_key) if record.source_record_key else "", using_db=db,
                         )
                         ref = await SongReference.create(
                             game_song=song, provider=provider, namespace=namespace, game_code=game_code,
@@ -215,16 +305,27 @@ class TortoiseCatalogStore:
                         report.song_ids[record.external_key] = ref.game_song_id
                         if ref.id not in previous_payloads or previous_payloads[ref.id]["payload"] != payload or not previous_payloads[ref.id]["present"]:
                             affected.add(ref.game_song_id)
-            report.missing_deferred = bool(not complete or report.pending or report.invalid or (not records and not allow_empty))
-            if not report.missing_deferred:
-                report.withdrawn = len(missing)
-                changed |= bool(missing)
+            unsafe_missing = bool(not complete or report.invalid or (not records and not allow_empty))
+            withdrawals = [] if unsafe_missing else [ref for ref in missing if ref.id not in held_ids]
+            report.missing_deferred = bool(unsafe_missing or held_ids)
+            if withdrawals:
+                report.withdrawn = len(withdrawals)
+                changed = True
                 if not dry_run:
-                    for ref in missing:
+                    for ref in withdrawals:
                         ref.present = False
                         await ref.save(using_db=db, update_fields=["present"])
                         affected.add(ref.game_song_id)
             if dry_run:
+                current = await GameSong.filter(game_code=game_code, active=True).using_db(db).count()
+                targeted = set(report.song_ids.values())
+                retiring = {ref.game_song_id for ref in withdrawals} - targeted
+                remaining = set(await SongReference.filter(game_song_id__in=retiring, present=True).exclude(
+                    id__in=[ref.id for ref in withdrawals]).using_db(db).values_list("game_song_id", flat=True)) if retiring else set()
+                retired_count = await GameSong.filter(game_code=game_code, id__in=retiring - remaining, active=True).using_db(db).count()
+                reactivated = await GameSong.filter(game_code=game_code, id__in=targeted, active=False).using_db(db).count()
+                report.available_song_count = current + report.created + reactivated - retired_count
+                report.outcome = "unusable" if not report.available_song_count and (report.pending or report.invalid or report.missing_deferred) else "partial" if report.pending or report.invalid or report.missing_deferred else "complete"
                 return report
             affected_ids = sorted(affected)
             for offset in range(0, len(affected_ids), 256):
@@ -244,6 +345,7 @@ class TortoiseCatalogStore:
                     await GameSong.filter(id=current["id"]).using_db(db).update(
                         title=payload["title"], artist=payload.get("artist", ""),
                         chart_variant=variant, catalog_payload=payload, active=True,
+                        edition_key=content_key(observation["identity_material"]["source_record_key"]) if observation["identity_material"].get("source_record_key") else "",
                         version=current["version"] + int(semantic_changed),
                     )
                     if current["title"] != payload["title"]:
@@ -261,6 +363,12 @@ class TortoiseCatalogStore:
                     db, game_code, records, report.song_ids, provider=provider, namespace=namespace,
                     complete=(complete or alias_complete) and not report.pending and not report.invalid, expected_versions=expected_alias_versions,
                 )
+                if withdrawals:
+                    from .alias_models import AliasEvidence
+                    for offset in range(0, len(withdrawals), 256):
+                        ids = [ref.id for ref in withdrawals[offset:offset + 256]]
+                        await AliasEvidence.filter(reference_id__in=ids, remote_state="present").using_db(db).update(remote_state="withdrawn", version=F("version") + 1)
+                    await TortoiseAliasStore(self).event(db, "withdraw_source_records", after={"reference_ids": [ref.id for ref in withdrawals]})
                 if self.auto_match:
                     await match_catalog(db)
                 latest_event = await AliasEvent.filter(actor_id__isnull=True).using_db(db).only("id").order_by("-id").first()
@@ -271,6 +379,8 @@ class TortoiseCatalogStore:
                 await AliasRevision.filter(id=1).using_db(db).update(revision=revision)
             raw_payload = raw_payload if raw_payload is not None else [record.raw for record in records]
             report.sync_version += 1
+            report.available_song_count = await GameSong.filter(game_code=game_code, active=True).using_db(db).count()
+            report.outcome = "unusable" if not report.available_song_count and (report.pending or report.invalid or report.missing_deferred) else "partial" if report.pending or report.invalid or report.missing_deferred else "complete"
             # Keep the last usable snapshot when a fetch is partial, invalid or unexpectedly empty.
             preserve_snapshot = not complete or bool(report.invalid or report.pending) or (not records and not allow_empty)
             snapshot_fields = {
@@ -278,6 +388,7 @@ class TortoiseCatalogStore:
                 "sync_version": report.sync_version,
                 "report": asdict(report),
                 "observed_payload": raw_payload,
+                "resolutions": resolutions,
             }
             if not preserve_snapshot:
                 snapshot_fields.update(raw_payload=raw_payload, snapshot_hash=content_key(raw_payload))

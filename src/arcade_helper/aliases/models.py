@@ -67,6 +67,7 @@ class AliasResolution:
     inferred_game: str | None
     inference_reason: str
     candidates: tuple[AliasCandidate, ...]
+    unavailable_games: tuple[str, ...] = ()
 
 
 def has_music_variant(title: str, payload: dict) -> bool:

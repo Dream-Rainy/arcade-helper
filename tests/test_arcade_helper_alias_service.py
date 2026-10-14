@@ -93,6 +93,181 @@ async def approve(service, operation, payload, *, actor=1, reviewer=10, key=None
     return request
 
 
+async def test_arcade_source_continuity_and_partial_recovery(catalog):
+    from arcade_helper.catalog.importer import prepare_arcade_catalog
+    from arcade_helper.games.arcade_songs import normalize_arcade_song
+    from arcade_helper.storage.tortoise.catalog_models import SongReference, CatalogImport
+
+    store, service = catalog
+    old = {"songId": "cat's scat", "title": "cat's scat", "artist": "Q-Mex", "version": "Home", "sheets": []}
+    unrelated = {"songId": "old", "title": "Unrelated old", "artist": "Other", "sheets": []}
+    legacy = await store.import_records("popn", [CatalogRecord(normalize_arcade_song(r, song_id=0), r) for r in (old, unrelated)],
+                                        provider="arcade_songs", raw_payload={"songs": [old, unrelated]})
+    anchor = legacy.song_ids[CatalogRecord(normalize_arcade_song(old, song_id=0), old).external_key]
+    ref = await SongReference.get(game_song_id=anchor)
+    title_evidence = await AliasEvidence.get(anchor_id=anchor, kind="title")
+    await approve(service, "RETRACT_EVIDENCE", {"evidence_id": title_evidence.id})
+    await approve(service, "ADD_ALIAS", {"game_song_id": anchor, "text": "Legacy Nick"})
+    await approve(service, "BLOCK_ALIAS", {"game_song_id": anchor, "text": "Legacy Nick"})
+    newer = {**old, "songId": "cat's scat (2)", "version": "Peace"}
+    # New edition before old edition must not steal or retire the existing anchor.
+    migrated = await store.import_arcade_catalog("popn", {"songs": [newer, old]})
+    assert not migrated.pending and migrated.created == 1 and migrated.withdrawn == 1
+    assert (await SongReference.get(id=ref.id)).game_song_id == anchor
+    assert (await AliasEvidence.get(id=title_evidence.id)).moderation_state == "revoked"
+    assert await AliasEvidence.filter(anchor_id=anchor, kind="title").count() == 1
+    assert not (await service.resolve_alias("Legacy Nick")).candidates
+    result = await service.search_all("cat's scat", game_code="popn")
+    assert len(result.candidates) == 2 and anchor in {c.game_song_id for c in result.candidates}
+    repeat = await store.import_arcade_catalog("popn", {"songs": [old, newer]})
+    assert repeat.unchanged == repeat.source_record_count == repeat.processed_record_count == 2
+    assert repeat.available_song_count == 2 and repeat.revision == migrated.revision
+    await import_song(store, "jubeat", title="cat's scat", artist="Q-Mex")
+    assert len(set(await GameSong.filter(title="cat's scat").values_list("work_id", flat=True))) == 3
+
+    missing = {"songId": "concon", "title": "concon〜INAReMIX〜", "artist": None, "sheets": []}
+    first = await store.import_arcade_catalog("gitadora", {"songs": [missing]})
+    song_id = next(iter(first.song_ids.values()))
+    assert first.outcome == "complete" and not first.pending
+    assert (await service.search_all(missing["title"])).candidates[0].game_song_id == song_id
+    enriched = await store.import_arcade_catalog("gitadora", {"songs": [{**missing, "artist": "Composer", "bpm": 190}]})
+    assert list(enriched.song_ids.values()) == [song_id] and enriched.updated == 1
+    assert not enriched.pending
+
+    # A real conflicting group keeps related records, while unrelated missing data retires.
+    base = {"title": "Conflict", "artist": "A", "sheets": []}
+    vanished = {"title": "Vanished", "artist": "B", "sheets": []}
+    await store.import_arcade_catalog("test", {"songs": [base, vanished]})
+    partial = await store.import_arcade_catalog("test", {"songs": [base, {**base, "bpm": 200}]})
+    assert partial.withdrawn == 1 and partial.pending_record_count == 2 and partial.outcome == "partial"
+    pending = partial.pending[0]
+    await approve(service, "MAP_SOURCE_RECORD", {"game_code": "test", "provider": "arcade_songs",
+        "external_key": pending["external_key"], "record_selector": pending["records"][1]["record_selector"], "decision": "reject"})
+    resolved = await store.import_arcade_catalog("test", {"songs": [base, {**base, "bpm": 200}]})
+    assert resolved.outcome == "complete" and not resolved.pending and resolved.rejected_record_count == 1
+    assert resolved.source_record_count == resolved.processed_record_count + resolved.rejected_record_count == 2
+    assert (await CatalogImport.get(game_code="test")).raw_payload is not None
+
+
+async def test_catalog_preparation_singleflight_failures_and_shutdown(catalog, tmp_path, monkeypatch):
+    from arcade_helper import ArcadeHelperClient
+    from arcade_helper.core.errors import CatalogSyncError
+    from arcade_helper.games.arcade_songs import ARCADE_SONGS_SITES_URL
+    from arcade_helper.catalog import service as catalog_module
+
+    store, _ = catalog
+    entered, release, waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    waiting_release = asyncio.Event()
+    calls = []
+    clock = [100.0]
+    broken = [True]
+    monkeypatch.setattr(catalog_module, "monotonic", lambda: clock[0])
+    titles = {"gitadora": "concon〜INAReMIX〜", "popn": "Waiting Song", "sdvx": "Recovered Song"}
+    async def get_json(url, **kwargs):
+        calls.append(url)
+        if url == ARCADE_SONGS_SITES_URL:
+            return [{"gameCode": game, "dataSourceUrl": f"https://fixture.test/{game}"} for game in titles] + [
+                {"gameCode": "maimai", "dataSourceUrl": "https://fixture.test/maimai"},
+                {"gameCode": "any", "dataSourceUrl": "https://fixture.test/any", "isHidden": True}]
+        game = url.split("/")[-2]
+        if game == "gitadora":
+            entered.set()
+            await release.wait()
+        if game == "popn":
+            waiting.set()
+            await waiting_release.wait()
+        if game == "sdvx" and broken[0]:
+            raise ConnectionError("fixture transport failed")
+        return {"songs": [{"songId": game, "title": titles[game], "artist": None, "sheets": []}]}
+
+    client = ArcadeHelperClient(http_get_json=get_json, local_data_dir=tmp_path, catalog_store=store)
+    await client.lifecycle.start()
+    first = asyncio.create_task(client.catalog.search_song("gitadora", titles["gitadora"]))
+    second = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        second = asyncio.create_task(client.catalog.search_song("gitadora", titles["gitadora"]))
+        await asyncio.sleep(0)
+        release.set()
+        results = await asyncio.wait_for(asyncio.gather(first, second), 3)
+        assert all(r[0].title == titles["gitadora"] for r in results)
+        assert results[0][0].song_id == results[1][0].song_id
+        assert calls.count("https://fixture.test/gitadora/data.json") == 1
+        result = await client.catalog.search_all(titles["gitadora"], text_only=True)
+        assert result.candidates and result.inferred_game is None
+        assert set(result.unavailable_games) == {"popn", "sdvx"}
+        await asyncio.wait_for(waiting.wait(), 2)
+        with pytest.raises(CatalogSyncError, match="initializing or unavailable"):
+            await client.catalog.search_all(titles["popn"])
+        with pytest.raises(CatalogSyncError):
+            await client.catalog.search_song("sdvx", titles["sdvx"])
+        attempts = calls.count("https://fixture.test/sdvx/data.json")
+        with pytest.raises(CatalogSyncError):
+            await client.catalog.search_song("sdvx", titles["sdvx"])
+        assert attempts == calls.count("https://fixture.test/sdvx/data.json") == 1
+        clock[0] += 31
+        broken[0] = False
+        assert (await client.catalog.search_song("sdvx", titles["sdvx"]))[0].title == titles["sdvx"]
+        assert calls.count("https://fixture.test/sdvx/data.json") == 2
+        task = client.catalog._catalog_tasks["popn"]
+        await asyncio.wait_for(client.lifecycle.stop(), 2)
+        assert task.cancelled() and client.state == "stopped"
+    finally:
+        release.set()
+        await client.lifecycle.stop()
+        await asyncio.gather(first, *([second] if second else []), return_exceptions=True)
+
+    waiting_release.set()
+    warmed = ArcadeHelperClient(http_get_json=get_json, local_data_dir=tmp_path, catalog_store=store)
+    await warmed.lifecycle.start()
+    try:
+        prepared = await warmed.catalog.prepare_catalogs()
+        assert set(prepared) == set(titles)
+        assert (await warmed.catalog.search_all(titles["popn"])).inferred_game == "popn"
+        count = len(calls)
+        await warmed.catalog.search_song("popn", titles["popn"])
+        await warmed.catalog.search_all(titles["gitadora"])
+        assert len(calls) == count  # Warm searches never fetch all catalogs again.
+        assert not any("/any/" in url or "/maimai/" in url for url in calls)
+    finally:
+        await warmed.lifecycle.stop()
+
+
+async def test_first_import_race_between_independent_catalog_connections(catalog):
+    from arcade_helper import ArcadeHelperClient
+    from arcade_helper.games.arcade_songs import ARCADE_SONGS_SITES_URL
+
+    store, _ = catalog
+    peer = TortoiseCatalogStore(connection_name="peer", enable_aliases=True)
+    entered, release = asyncio.Event(), asyncio.Event()
+    fetches = 0
+    async def get_json(url, **kwargs):
+        nonlocal fetches
+        if url == ARCADE_SONGS_SITES_URL:
+            return [{"gameCode": "race", "dataSourceUrl": "https://fixture.test/race"}]
+        fetches += 1
+        if fetches == 2:
+            entered.set()
+        await release.wait()
+        return {"songs": [{"songId": "one", "title": "Race Song", "artist": None, "sheets": []}]}
+    clients = [ArcadeHelperClient(http_get_json=get_json, catalog_store=backend) for backend in (store, peer)]
+    for client in clients:
+        await client.lifecycle.start()
+    tasks = [asyncio.create_task(client.catalog.search_song("race", "Race Song")) for client in clients]
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        release.set()
+        results = await asyncio.wait_for(asyncio.gather(*tasks), 3)
+        assert results[0][0].song_id == results[1][0].song_id
+        assert await GameSong.filter(game_code="race").count() == 1
+        assert await store.get_sync_version("race") == 1
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for client in clients:
+            await client.lifecycle.stop()
+
+
 async def test_pending_work_deduplication_reuses_legacy_keys_and_keeps_distinct_entries(catalog):
     from arcade_helper.catalog.importer import content_key
     store, service = catalog

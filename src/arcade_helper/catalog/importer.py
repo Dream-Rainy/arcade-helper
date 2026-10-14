@@ -24,8 +24,11 @@ class CatalogRecord:
     song: SongData
     raw: dict
     native_key: str | None = None
+    source_record_key: str | None = None
 
     def __post_init__(self):
+        if self.source_record_key is not None and (not isinstance(self.source_record_key, str) or not 0 < len(self.source_record_key) <= 512):
+            raise ValueError("Invalid source record key")
         object.__setattr__(self, "song", self.song.model_copy(update={
             "title": normalize_width(self.song.title),
             "aliases": [normalize_width(text) for text in self.song.aliases],
@@ -39,10 +42,18 @@ class CatalogRecord:
             self.song.chart_variant if "chart_variant" in self.song.model_fields_set
             else parse_chart_title(self.song.title)[1]
         )
-        return song_identity_material(
+        material = song_identity_material(
             self.song.title, self.song.artist, variant,
             getattr(self.song, "music_variant", None),
         )
+        if self.source_record_key is not None:
+            material["source_record_key"] = self.source_record_key
+        return material
+
+    @property
+    def selector(self) -> str:
+        """Snapshot observation checksum, never a permanent song identity."""
+        return content_key(self.raw)
 
     @property
     def external_key(self) -> str:
@@ -67,6 +78,14 @@ class CatalogImportReport:
     invalid: list[str] = field(default_factory=list)
     missing_deferred: bool = False
     song_ids: dict[str, int] = field(default_factory=dict)
+    source_record_count: int = 0
+    duplicate_record_count: int = 0
+    processed_record_count: int = 0
+    rejected_record_count: int = 0
+    pending_record_count: int = 0
+    available_song_count: int = 0
+    pending_reasons: dict[str, int] = field(default_factory=dict)
+    outcome: str = "complete"
 
 
 def prepare_native_catalog(game_code: str, songs: dict[int, SongData]) -> tuple[list[CatalogRecord], list[str]]:
@@ -98,6 +117,11 @@ def prepare_native_catalog(game_code: str, songs: dict[int, SongData]) -> tuple[
     return records, invalid
 
 
+def arcade_record_key(raw: dict) -> str | None:
+    value = raw.get("songId")
+    return value if isinstance(value, str) and 0 < len(value) <= 512 else None
+
+
 def prepare_arcade_catalog(payload: dict) -> tuple[list[CatalogRecord], list[str]]:
     """Preserve malformed row diagnostics so a partial fetch cannot delete data.
 
@@ -117,7 +141,9 @@ def prepare_arcade_catalog(payload: dict) -> tuple[list[CatalogRecord], list[str
                 raise ValueError("invalid sheets list")
             song = normalize_arcade_song(raw, song_id=0)
             alias_key(song.title)
-            records.append(CatalogRecord(song=song, raw=raw))
+            record = CatalogRecord(song=song, raw=raw, source_record_key=arcade_record_key(raw))
+            record.selector
+            records.append(record)
         except (TypeError, ValueError) as exc:
             invalid.append(f"songs[{index}]: {exc}")
     return records, invalid

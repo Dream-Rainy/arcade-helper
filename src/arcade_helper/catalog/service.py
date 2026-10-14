@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import traceback
 import warnings
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from time import monotonic
 from typing import Any, Literal
@@ -46,6 +46,7 @@ class CatalogSyncResult:
     songs: dict[int, Any] | None = None
     data_version: int | None = None
     error: Exception | None = None
+    import_report: CatalogImportReport | None = None
 
     @property
     def ok(self) -> bool:
@@ -77,6 +78,119 @@ class SongCatalogService:
         self.arcade_songs = ArcadeSongsCatalogService(self)
         self.logger = logger
         self._sync_locks: dict[str, asyncio.Lock] = {}
+        self._catalog_tasks: dict[str, asyncio.Task] = {}
+        self._catalog_failed_at: dict[str, float] = {}
+        self._catalog_ready: dict[str, tuple] = {}
+        self._catalog_games: tuple[str, ...] | None = None
+        self._catalog_slots = asyncio.Semaphore(2)
+        self._closed = False
+
+    def _can_prepare_catalogs(self) -> bool:
+        return self.identities is not None and any(
+            route.operation.key == "arcade_songs.catalog.payload" for route in self.providers.operations())
+
+    async def _catalog_state(self, game: str) -> str:
+        generation = (getattr(self.identities, "_db", None), await self.get_revision(),
+                      await self.identities.get_sync_version(game))
+        if self._catalog_ready.get(game) == generation:
+            return "ready"
+        report = await self.identities.get_import(game)
+        if report is None:
+            state = "ready" if await self.identities.load_song_index(game) else "missing"
+        else:
+            outcome = report.get("outcome")
+            if outcome == "complete" or (outcome is None and not report.get("pending") and not report.get("invalid") and not report.get("missing_deferred")):
+                state = "ready"
+            else:
+                count = report.get("available_song_count")
+                if count is None:
+                    count = len(await self.identities.load_song_index(game))
+                state = "partial" if count else "missing"
+        if state == "ready":
+            self._catalog_ready[game] = generation
+        return state
+
+    async def _generic_games(self, *, force_refresh: bool = False) -> tuple[str, ...]:
+        if self._catalog_games is None:
+            sites = await self.arcade_songs.sites(force_refresh=force_refresh)
+            self._catalog_games = tuple(dict.fromkeys(
+                code for site in sites if isinstance(site, dict) and not site.get("isHidden")
+                and isinstance(code := site.get("gameCode"), str) and 0 < len(code) <= 32
+                and code == code.strip().lower() and code not in {"maimai", "chunithm"}
+            ))
+        return self._catalog_games
+
+    async def _prepare_generic_catalog(self, game: str, force_refresh: bool):
+        async with self._lock_for_game(game):
+            if not force_refresh and await self._catalog_state(game) != "missing":
+                return await self.identities.get_import(game)
+            async with self._catalog_slots:
+                try:
+                    report = await self.import_catalog(game, force_refresh=force_refresh)
+                except Exception as exc:
+                    from arcade_helper.storage.tortoise.catalog_store import CatalogConflictError
+                    # Another process may have won publication with the same fetch token.
+                    if isinstance(exc, CatalogConflictError) and await self._catalog_state(game) != "missing":
+                        return await self.identities.get_import(game)
+                    raise CatalogSyncError(f"Catalog {game} preparation failed: {exc}") from exc
+            if report.outcome == "unusable":
+                raise CatalogSyncError(f"Catalog {game} has no usable records: {report.pending_reasons}; invalid={len(report.invalid)}")
+            return asdict(report)
+
+    def _start_catalog_task(self, game: str, *, force_refresh: bool = False):
+        if self._closed:
+            raise CatalogSyncError("Catalog service is closed")
+        task = self._catalog_tasks.get(game)
+        if task is not None and not task.cancelled():
+            if not task.done():
+                return task
+            if task.exception() is not None:
+                self._catalog_failed_at.setdefault(game, monotonic())
+            if not force_refresh and task.exception() is not None and monotonic() - self._catalog_failed_at.get(game, 0) < 30:
+                return task
+        task = asyncio.create_task(self._prepare_generic_catalog(game, force_refresh))
+        self._catalog_tasks[game] = task
+        def completed(done):
+            if not done.cancelled() and done.exception() is not None:
+                self._catalog_failed_at[game] = monotonic()
+        task.add_done_callback(completed)
+        return task
+
+    async def _ensure_generic_catalog(self, game_code: str) -> None:
+        game = str(game_code).strip().lower()
+        if game in {"maimai", "chunithm"} or not self._can_prepare_catalogs():
+            return
+        if await self._catalog_state(game) == "missing":
+            await asyncio.shield(self._start_catalog_task(game))
+
+    async def prepare_catalogs(self, game_codes=None, *, force_refresh: bool = False) -> dict:
+        """Prepare persistent generic catalogs; failures name the unavailable games."""
+        if not self._can_prepare_catalogs():
+            raise StorageNotConfiguredError("Catalog preparation requires persistent storage and an arcade-songs provider")
+        if force_refresh and game_codes is None:
+            self._catalog_games = None
+        if isinstance(game_codes, str):
+            game_codes = [game_codes]
+        games = tuple(dict.fromkeys(str(game).strip().lower() for game in (game_codes if game_codes is not None else await self._generic_games(force_refresh=force_refresh))))
+        if any(not game or len(game) > 32 for game in games):
+            raise ValueError("Invalid game code")
+        tasks = [self._start_catalog_task(game, force_refresh=force_refresh) for game in games if game not in {"maimai", "chunithm"}]
+        results = await asyncio.gather(*(asyncio.shield(task) for task in tasks), return_exceptions=True)
+        selected = [game for game in games if game not in {"maimai", "chunithm"}]
+        failures = {game: str(result) for game, result in zip(selected, results) if isinstance(result, BaseException)}
+        if failures:
+            raise CatalogSyncError(f"Catalog preparation failed: {failures}")
+        return dict(zip(selected, results))
+
+    async def close(self) -> None:
+        self._closed = True
+        tasks = list(self._catalog_tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await self.search._stop_index_builds()
+        if self.identities is not None and getattr(self.identities, "_text_search", None) is not None:
+            await self.identities.text_search._stop_index_builds()
 
     def _operation_for_catalog(self, game_code: str) -> str:
         if game_code == "maimai":
@@ -201,11 +315,12 @@ class SongCatalogService:
         async with lock:
             try:
                 if self.identities is not None and game_code not in {"maimai", "chunithm"}:
-                    await self.import_catalog(game_code)
+                    report = await self.import_catalog(game_code)
                     return CatalogSyncResult(
                         game_code=game_code, provider="arcade_songs", operation=operation,
                         status="success", started_at=started_at, finished_at=datetime.now(),
-                        songs=await self.load_all_songs(game_code) if include_songs else None,
+                        songs=await self.identities.load_all_songs(game_code) if include_songs else None,
+                        import_report=report,
                     )
                 alias_versions = await self.aliases.source_versions(game_code) if self._aliases_enabled() else None
                 sync_version = await self.identities.get_sync_version(game_code, provider="catalog", namespace="native") if self._aliases_enabled() else None
@@ -288,10 +403,36 @@ class SongCatalogService:
         return bool(self.identities is not None and getattr(self.identities, "enable_aliases", False))
 
     async def search_all(self, query, *, game_code=None, text_only=False):
-        return await self.aliases.search_all(query, game_code=game_code, text_only=text_only)
+        return await self._query_catalog(query, game_code=game_code, text_only=text_only)
 
     async def resolve_alias(self, query, *, game_code=None):
-        return await self.aliases.resolve_alias(query, game_code=game_code)
+        return await self._query_catalog(query, game_code=game_code, aliases_only=True)
+
+    async def _query_catalog(self, query, *, game_code=None, text_only=False, aliases_only=False):
+        if not self._aliases_enabled():
+            raise StorageNotConfiguredError("Enable aliases on a persistent catalog store first")
+        unavailable = []
+        if game_code is not None:
+            game_code = str(game_code).strip().lower()
+            await self._ensure_generic_catalog(game_code)
+            if self._can_prepare_catalogs() and game_code not in {"maimai", "chunithm"} and await self._catalog_state(game_code) == "partial":
+                unavailable.append(game_code)
+        elif self._can_prepare_catalogs():
+            for game in await self._generic_games():
+                state = await self._catalog_state(game)
+                if state != "ready":
+                    unavailable.append(game)
+                if state == "missing":
+                    self._start_catalog_task(game)
+        result = (await self.aliases.resolve_alias(query, game_code=game_code) if aliases_only else
+                  await self.aliases.search_all(query, game_code=game_code, text_only=text_only))
+        if unavailable and not result.candidates:
+            raise CatalogSyncError(f"Catalogs initializing or unavailable: {', '.join(unavailable)}; retry or await prepare_catalogs()")
+        if unavailable:
+            result = (replace(result, inferred_game=None, resolution="ambiguous", inference_reason="catalog_incomplete",
+                              unavailable_games=tuple(unavailable)) if game_code is None else
+                      replace(result, unavailable_games=tuple(unavailable)))
+        return result
 
     async def get_effective_aliases(self, game_song_id):
         return await self.aliases.get_effective_aliases(game_song_id)
@@ -320,6 +461,7 @@ class SongCatalogService:
         )
         if not dry_run:
             self.invalidate_search_cache(game_code)
+            self._catalog_failed_at.pop(game_code, None)
         return report
 
     async def preview_import(self, game_code: str, *, force_refresh: bool = True) -> CatalogImportReport:
@@ -332,6 +474,7 @@ class SongCatalogService:
 
     async def get_song_by_id(self, game_code: str, song_id: int):
         """Return one song by game code and song id."""
+        await self._ensure_generic_catalog(game_code)
         song = await self._read_store(game_code).get_song_by_id(game_code, song_id)
         if song is not None and self._aliases_enabled() and game_code in {"maimai", "chunithm"}:
             from arcade_helper.storage.tortoise.catalog_models import SongReference
@@ -355,6 +498,7 @@ class SongCatalogService:
         ids = list(dict.fromkeys(song_ids))
         if not ids:
             return {}
+        await self._ensure_generic_catalog(game_code)
         store = self._read_store(game_code)
         batch = getattr(store, "get_songs_by_ids", None)
         for _ in range(3):
@@ -421,6 +565,7 @@ class SongCatalogService:
 
     async def load_all_songs(self, game_code: str):
         """Load all songs for a game from the configured song store."""
+        await self._ensure_generic_catalog(game_code)
         songs = await self._read_store(game_code).load_all_songs(game_code)
         if self._aliases_enabled() and game_code in {"maimai", "chunithm"}:
             aliases = await self.identities.native_aliases(game_code)
@@ -432,6 +577,7 @@ class SongCatalogService:
 
     async def load_song_index(self, game_code: str) -> dict[int, str]:
         """Load the song id to title index for a game."""
+        await self._ensure_generic_catalog(game_code)
         if self._aliases_enabled():
             records = list((await self.identities.load_song_index(game_code)).items())
             return dict(await self._native_matches(game_code, records))
@@ -452,6 +598,7 @@ class SongCatalogService:
         return list(dict.fromkeys((native, text) for sid, text in records for native in native_ids.get(sid, [])))
 
     async def query_title_exact(self, game_code: str, title: str):
+        await self._ensure_generic_catalog(game_code)
         if self._aliases_enabled():
             return await self._native_matches(game_code, await self.identities.query_title_exact(game_code, title))
         store = self._read_store(game_code)
@@ -462,6 +609,7 @@ class SongCatalogService:
 
     async def load_search_songs(self, game_code: str):
         """Read text metadata for ranking and background vector preparation."""
+        await self._ensure_generic_catalog(game_code)
         if self._aliases_enabled():
             songs = await self.identities.load_search_songs(game_code)
             mapped = await self._native_matches(game_code, [(sid, str(sid)) for sid in songs])
@@ -472,18 +620,21 @@ class SongCatalogService:
 
     async def query_alias_exact(self, game_code: str, alias_lower: str) -> list[tuple[int, str]]:
         """Return alias records matching a normalized alias exactly."""
+        await self._ensure_generic_catalog(game_code)
         if self._aliases_enabled():
             return await self._native_matches(game_code, await self.identities.query_alias_exact(game_code, alias_lower))
         return await self._read_store(game_code).query_alias_exact(game_code, alias_lower)
 
     async def load_alias_records(self, game_code: str) -> list[tuple[int, str]]:
         """Load all alias records for a game."""
+        await self._ensure_generic_catalog(game_code)
         if self._aliases_enabled() and game_code in {"maimai", "chunithm"}:
             return [(key, text) for key, aliases in (await self.identities.native_aliases(game_code)).items() for text in aliases]
         return await self._read_store(game_code).load_alias_records(game_code)
 
     async def get_song_aliases_for_song_id(self, game_code: str, song_id: int) -> list[str]:
         """Return aliases attached to one song."""
+        await self._ensure_generic_catalog(game_code)
         if self._aliases_enabled() and game_code in {"maimai", "chunithm"}:
             song = await self.get_song_by_id(game_code, song_id)
             return song.aliases if song else []
@@ -497,6 +648,7 @@ class SongCatalogService:
         level_index: int = 3,
     ) -> dict | None:
         """Return one song plus the requested difficulty sheet."""
+        await self._ensure_generic_catalog(game_code)
         result = await self._read_store(game_code).get_song_with_difficulty(
             game_code,
             song_id,
@@ -522,6 +674,10 @@ class SongCatalogService:
     def invalidate_search_cache(self, game_code: str | None = None) -> None:
         """Clear cached alias/search data for one game or all games."""
         invalidate_alias_cache(game_code)
+        if game_code is None:
+            self._catalog_ready.clear()
+        else:
+            self._catalog_ready.pop(game_code, None)
 
     def _optional_song_store(self) -> Any | None:
         return self.songs
@@ -543,11 +699,11 @@ class ArcadeSongsCatalogService:
         self._searches: dict[str, SongSearchService] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
-    async def sites(self) -> list[dict[str, Any]]:
+    async def sites(self, *, force_refresh: bool = False) -> list[dict[str, Any]]:
         """Fetch generic arcade-songs site metadata."""
         route = self._catalog.providers.require("arcade_songs.catalog.sites")
         method = self._catalog._provider_method(route.provider, route.operation.method)
-        sites = await method()
+        sites = await method(force_refresh=True) if force_refresh else await method()
         return sites if isinstance(sites, list) else []
 
     async def catalog(

@@ -93,10 +93,15 @@ async def match_catalog(db):
     def blocked(left, right):
         return any(not members[right.work_id].isdisjoint(rejected_neighbors.get(sid, ())) for sid in members[left.work_id])
 
+    editions = defaultdict(set)
+    for song in songs:
+        editions[(song.game_code, exact_titles[song.id], artists[song.id])].add(song.work_id)
+
     def compatible(left, right):
         return (left.game_code != right.game_code and left.chart_variant == right.chart_variant == []
                 and exact_titles[left.id] == exact_titles[right.id]
-                and bool(left.artist.strip()) and artists[left.id] == artists[right.id])
+                and bool(left.artist.strip()) and artists[left.id] == artists[right.id]
+                and all(len(editions[(s.game_code, exact_titles[s.id], artists[s.id])]) == 1 for s in (left, right)))
 
     pairs = set()
     pair_count = 0

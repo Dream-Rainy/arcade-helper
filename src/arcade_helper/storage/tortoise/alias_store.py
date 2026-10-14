@@ -488,7 +488,7 @@ class TortoiseAliasStore:
             "REPLACE_ALIAS": {"evidence_id", "game_song_id", "text", "scope", "origin_game"},
             "BLOCK_ALIAS": {"game_song_id", "text"}, "UNBLOCK_ALIAS": {"game_song_id", "text"},
             "RELINK_GAME_SONGS": {"song_ids", "mode"},
-            "MAP_SOURCE_RECORD": {"game_code", "provider", "namespace", "external_key", "decision", "target_id"},
+            "MAP_SOURCE_RECORD": {"game_code", "provider", "namespace", "external_key", "decision", "target_id", "record_selector"},
         }
         if operation not in allowed or not isinstance(payload, dict) or set(payload) - allowed[operation] - {"evidence_url", "previous_request_id"}:
             raise ValueError("Invalid operation/payload fields")
@@ -519,6 +519,9 @@ class TortoiseAliasStore:
             payload.setdefault("namespace", "default")
             if payload.get("decision") not in {"bind", "new", "reject"} or (payload["decision"] == "bind" and not payload.get("target_id")):
                 raise ValueError("Invalid source mapping")
+            if "record_selector" in payload and (not isinstance(payload["record_selector"], str)
+                                                or len(payload["record_selector"]) != 64):
+                raise ValueError("Invalid source observation selector")
             await self._mapping_record(db, payload)
         return payload
 
@@ -743,7 +746,12 @@ class TortoiseAliasStore:
         key = content_key([payload["provider"], payload["namespace"], payload["game_code"]])
         batch = await CatalogImport.get(source_key=key).using_db(db)
         records, _ = prepare_arcade_catalog(batch.observed_payload)
-        found = [r for r in records if r.external_key == payload["external_key"]]
+        found = [r for r in records if r.external_key == payload["external_key"]
+                 and ("record_selector" not in payload or r.selector == payload["record_selector"])]
+        if found and all(r.raw == found[0].raw for r in found):
+            found = found[:1]
+        if len(found) > 1 and payload.get("decision") == "reject" and "record_selector" not in payload:
+            found = found[:1]
         if len(found) != 1:
             raise AliasConflictError("Source record is missing or ambiguous in the latest snapshot")
         return batch, found[0]
@@ -751,6 +759,9 @@ class TortoiseAliasStore:
     async def _map_record(self, db, data, actor_id, request_id, reason):
         batch, record = await self._mapping_record(db, data)
         decision = data["decision"]
+        same_key = [r for r in prepare_arcade_catalog(batch.observed_payload)[0] if r.external_key == record.external_key]
+        if len({r.selector for r in same_key}) > 1 and decision != "reject":
+            raise AliasConflictError("A persistent source discriminator is required before binding conflicting observations")
         if decision != "reject":
             identity = record.identity
             payload = record.song.model_dump(mode="json")
@@ -758,7 +769,8 @@ class TortoiseAliasStore:
             if decision == "new":
                 work = await MusicWork.create(display_title=record.song.title, artist=record.song.artist, using_db=db)
                 target = await GameSong.create(work=work, game_code=data["game_code"], title=record.song.title,
-                    artist=record.song.artist, chart_variant=identity["chart_variant"], catalog_payload=payload, using_db=db)
+                    artist=record.song.artist, chart_variant=identity["chart_variant"], catalog_payload=payload,
+                    edition_key=content_key(record.source_record_key) if record.source_record_key else "", using_db=db)
             else:
                 target = await GameSong.get(id=data["target_id"]).using_db(db)
                 if target.game_code != data["game_code"]:
@@ -802,7 +814,7 @@ class TortoiseAliasStore:
             ref = await SongReference.filter(reference_key=content_key([
                 data["provider"], data["namespace"], data["game_code"], record.key_kind, record.external_key,
             ])).using_db(db).first()
-            if ref:
+            if ref and ("record_selector" not in data or content_key(ref.raw_payload) == data["record_selector"]):
                 ref.present = False
                 await ref.save(using_db=db, update_fields=["present"])
                 await AliasEvidence.filter(reference=ref).using_db(db).update(remote_state="withdrawn", version=F("version") + 1)
@@ -813,7 +825,14 @@ class TortoiseAliasStore:
                         catalog_payload=remaining.payload, version=F("version") + 1)
                 else:
                     await GameSong.filter(id=ref.game_song_id).using_db(db).update(active=False, version=F("version") + 1)
-        batch.resolutions = {**(batch.resolutions or {}), record.external_key: {"decision": decision}}
+        disposition = {"decision": decision, "identity": record.identity}
+        if decision != "reject":
+            disposition["target_id"] = target.id
+        if data.get("record_selector"):
+            # A selected rejection excludes only this observation, not its conflicting siblings.
+            existing = (batch.resolutions or {}).get(record.external_key, {})
+            disposition = {**existing, "observations": {**existing.get("observations", {}), data["record_selector"]: disposition}}
+        batch.resolutions = {**(batch.resolutions or {}), record.external_key: disposition}
         batch.sync_version += 1
         await batch.save(using_db=db, update_fields=["resolutions", "sync_version"])
         await self.event(db, "map_source_record", actor_id=actor_id, request_id=request_id, after=data, reason=reason)
