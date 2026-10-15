@@ -22,6 +22,12 @@ storage-tortoise = [
 sse = [
     "aiohttp>=3.11,<4",
 ]
+web = [
+    "aiohttp>=3.11,<4",
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.32,<1",
+    "pycryptodome>=3.23,<4",
+]
 dev = [
     "aiohttp>=3.11,<4",
     "pytest>=8,<9",
@@ -31,6 +37,12 @@ dev = [
 
 [tool.setuptools]
 package-dir = { "" = "src" }
+
+[project.scripts]
+arcade-alias-relay = "arcade_helper.web.relay:main"
+
+[tool.setuptools.package-data]
+"arcade_helper.web" = ["static/*.html", "static/*.css", "static/*.js"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

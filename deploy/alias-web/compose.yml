@@ -1,0 +1,29 @@
+services:
+  relay:
+    build:
+      context: ../..
+      dockerfile: deploy/alias-web/Dockerfile
+    environment:
+      ARCADE_RELAY_TOKEN: ${ARCADE_RELAY_TOKEN:?Set a random service token}
+      ARCADE_RELAY_ORIGIN: https://${ALIAS_WEB_DOMAIN:?Set the public domain}
+      FORWARDED_ALLOW_IPS: "*"
+    restart: unless-stopped
+    networks: [editor]
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      ALIAS_WEB_DOMAIN: ${ALIAS_WEB_DOMAIN:?Set the public domain}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+    networks: [editor]
+networks:
+  editor:
+volumes:
+  caddy_data:
+  caddy_config:

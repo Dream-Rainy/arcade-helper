@@ -211,3 +211,29 @@ uv build --out-dir dist
 `catalog.get_songs_by_ids(game_code, song_ids)` 批量返回完整的 `dict[int, SongData]`，包含难度、封面和有效别名。结果按请求 ID 的首次出现顺序排列，去除重复并省略不存在或停用的歌曲；maimai/CHUNITHM 使用游戏原生 ID，其他持久曲库使用内部歌曲 ID。自定义搜索仓库或存储可实现同签名的可选方法，搜索会在返回最终候选前批量补全详情；未实现时兼容逐首读取。未实现其他可选方法的自定义存储继续使用原有索引与完整歌曲读取方式。
 
 启用别名存储的 Tortoise 曲库查询使用规范化证据键，并保留作品范围、来源状态、审核和屏蔽规则。未启用别名存储的通用旧曲库仍从原 JSON 读取别名。
+
+## 独立别名网页与中继
+
+`web` extra 提供独立网页、中继 CLI 和机器人出站编辑会话。安装 `pip install '.[web]'` 后可运行 `arcade-alias-relay`，或 `python -m arcade_helper.web.relay`。它不加载 NoneBot、数据库或机器人配置。
+
+本机验证（HTTP 仅限 localhost）：
+
+```powershell
+$env:ARCADE_RELAY_TOKEN = '<至少32字符的随机服务密钥>'
+$env:ARCADE_RELAY_ORIGIN = 'http://127.0.0.1:8765'
+arcade-alias-relay --host 127.0.0.1 --port 8765
+```
+
+公网部署推荐独立 VPS/域名 + Docker + Caddy，模板位于 `deploy/alias-web`：
+
+1. 将域名 DNS 指向中继服务器；允许该服务器的 TCP 80/443。
+2. 在 `deploy/alias-web` 中将 `.env.example` 复制为 `.env`，设置 `ALIAS_WEB_DOMAIN`。用 `python -c "import secrets; print(secrets.token_urlsafe(32))"` 生成 `ARCADE_RELAY_TOKEN`；不要提交 `.env`。
+3. 从此目录执行 `docker compose -f compose.yml up -d --build`。Caddy 自动申请 HTTPS 证书并代理 WebSocket；中继的 8765 端口仅在容器网络内使用。
+4. 机器人配置 `alias_web_relay_url=https://你的域名`、`alias_web_relay_token=<同一服务密钥>`；`alias_web_enabled=true`。重启机器人。机器人只发起出站 HTTPS/WSS 连接，不注册别名网页 HTTP 路由；中继不访问数据库。两项中继配置均必填，未配置时编辑器命令会提示补全配置。
+5. 私聊机器人发送 `/arcade.editor`，打开临时链接即可提交、匹配和审批，无需再发确认指令。机器人创建链接时绑定真实用户身份，浏览器自动完成链接密钥校验；禁止提交者及共同提交者自审，权限仍由机器人实时检查。
+
+只部署一个中继进程和一个机器人进程。会话最长一小时；退出、断开、刷新网页或任一端重启后需要新建会话。断线时刚提交的操作可能已经生效，请重新连接后检查请求状态。临时链接是创建者身份的授权凭证，拿到链接的人可以使用该身份，请勿转发。链接密钥仅保存在 URL fragment，页面读取后立即清除，浏览器以绑定通道和临时公钥的 HMAC-SHA256 证明自动鉴权；浏览器不会向网页或中继服务器发送明文密钥。中继不保存业务快照；消息以临时 P-256/ECDH、HKDF 和 AES-GCM 端到端加密，递增序列号拒绝篡改/重放。服务密钥仅用于创建中继通道；业务权限、版本校验和人工审核规则继续由机器人执行。
+
+模板没有预设你的真实域名，也不会自动发布。生产证书和公网连通性需在选择域名后验证。长期托管时保留 `caddy_data`/`caddy_config` 卷并维护 HTTPS 服务；页面不依赖 CDN。
+
+升级自动链接鉴权时请同时更新机器人和中继网页，并重新生成编辑链接；旧页面和旧链接不兼容新握手。

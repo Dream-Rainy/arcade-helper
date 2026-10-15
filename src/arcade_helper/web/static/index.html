@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light"><title>乐曲别名工作台</title>
+  <link rel="stylesheet" href="./portal.css"><script src="./relay.js" defer></script><script src="./portal.js" defer></script>
+</head>
+<body>
+<header class="topbar"><a class="brand" href="./"><span class="brand-icon" aria-hidden="true">♫</span><span>乐曲别名<span class="brand-sub">工作台</span></span></a><div id="account" hidden><span id="identity"></span><button id="logout" class="quiet">退出</button></div></header>
+<main>
+  <div id="notice" role="status" aria-live="polite" hidden></div>
+  <section id="login" class="login-card">
+    <span class="eyebrow">ARCADE · ALIAS</span><h1>把别名连到正确的乐曲</h1>
+    <p class="muted">搜索、提交、匹配和审核，在一个页面完成。</p>
+    <ol class="steps"><li><strong>私聊机器人获取链接</strong><span>发送 /arcade.editor，打开返回的临时链接。</span></li><li><strong>打开后自动进入工作台</strong><span>身份和权限由机器人确认，无需再次发送指令。</span></li></ol>
+    <p class="hint">链接是你的临时凭证，请勿转发。会话最长一小时；断线、退出或刷新后请重新获取链接。</p>
+  </section>
+  <div id="workspace" hidden>
+    <div class="page-heading"><div><span class="eyebrow">音乐不止一个名字</span><h1>别名工作台</h1></div><span class="pill">跨游戏共享 · 来源可追溯</span></div>
+    <nav class="tabs" aria-label="工作区"><button data-view="submit" aria-current="page">提交别名</button><button data-view="review" class="admin-only" hidden>审核请求</button><button data-view="match" class="admin-only" hidden>曲库匹配</button></nav>
+    <section id="view-submit">
+      <div class="split">
+        <section class="panel"><div class="panel-heading"><h2>1. 找到乐曲</h2><span class="muted">必须选择具体收录</span></div>
+          <form id="song-search" class="search-form"><label for="game-filter">游戏</label><select id="game-filter"><option value="">全部游戏</option></select><label for="song-query">曲名、ID 或已有别名</label><div class="input-row"><input id="song-query" required maxlength="256" placeholder="例如 concon〜INAReMIX〜"><button>搜索</button></div></form>
+          <p id="search-summary" class="muted">先搜索，再从结果中选择乐曲。</p><div id="song-results" class="results"></div>
+        </section>
+        <section class="panel"><h2>2. 确认并提交</h2><div id="selection-empty" class="empty">选择左侧搜索结果后，确认音乐版本和别名来源。</div>
+          <div id="song-selected" hidden><div id="selected-info"></div><details><summary>同作品的收录</summary><div id="linked-entries"></div></details><div id="evidence-list"></div>
+            <form id="alias-form"><label for="alias-text">新别名 <span class="required">*</span></label><input id="alias-text" required maxlength="256" placeholder="输入玩家常用的别名">
+              <label for="alias-scope">适用范围</label><select id="alias-scope"><option value="work">同一作品的所有游戏收录</option><option value="game_song">仅当前游戏的这一收录</option></select><p class="hint">共享别名仍记录来源，未指定游戏时优先推断来源游戏。</p>
+              <label for="alias-origin">别名来源</label><select id="alias-origin"><option value="selected">当前游戏</option><option value="general">通用来源，不优先推断游戏</option></select>
+              <label for="alias-reason">说明 / 依据</label><textarea id="alias-reason" maxlength="2000" rows="3" placeholder="例如社区惯用称呼、出处或纠错原因"></textarea><label for="alias-url">参考链接（可选）</label><input id="alias-url" type="url" maxlength="2048" placeholder="https://">
+              <button>提交，等待审核</button><p class="hint">审核通过后生效。重复提交会合并；任何参与提交的人都不能审批该请求。</p>
+            </form>
+          </div>
+        </section>
+      </div>
+      <section class="panel history"><div class="panel-heading"><h2>我的提交</h2><select id="my-status" aria-label="我的提交状态"><option value="pending">待审核</option><option value="">全部状态</option><option value="approved">已通过</option><option value="rejected">已拒绝</option><option value="withdrawn">已撤回</option></select><button id="my-refresh" class="quiet">刷新</button></div><div id="my-list"></div><button id="my-more" class="secondary" hidden>加载更多</button></section>
+    </section>
+    <section id="view-review" hidden><div class="split"><section class="panel"><div class="panel-heading"><h2>审核队列</h2><select id="review-status" aria-label="审核状态"><option value="pending">待审核</option><option value="">全部状态</option><option value="approved">已通过</option><option value="rejected">已拒绝</option></select><button id="review-refresh" class="quiet">刷新</button></div><p class="hint">自己的提交和共同提交不能审核。</p><div id="review-list"></div><button id="review-more" class="secondary" hidden>加载更多</button></section><section class="panel"><h2>核对影响</h2><div id="review-detail" class="empty">选择请求，查看歌曲、来源、范围和冲突。</div></section></div></section>
+    <section id="view-match" hidden><section class="panel"><div class="panel-heading"><h2>同一音乐的跨游戏匹配</h2><button id="candidate-refresh" class="quiet">刷新</button><button id="associate-open" class="secondary">重新计算匹配</button></div><p class="hint">特殊谱面标记不代表新的音乐版本；Remix、Long 等音乐版本需单独核对。</p><div id="candidate-list" class="candidate-grid"></div><button id="candidate-more" class="secondary" hidden>加载更多</button></section>
+      <section class="panel history"><div class="panel-heading"><h2>来源待定记录</h2><button id="import-refresh" class="quiet">刷新</button></div><p class="hint">绑定现有收录、确认新曲或忽略错误记录均生成审核请求。快照变化后需要重新选择来源记录。</p><div id="import-list" class="import-grid"></div><div id="pending-list"></div><button id="pending-more" class="secondary" hidden>加载更多</button><div id="mapping-detail"></div></section>
+      <section class="panel history"><h2>手动调整作品关系</h2><p class="hint">用于候选队列之外的误匹配。先按游戏搜索并选择收录，再提交合并或拆分申请。</p><form id="relink-search" class="search-form"><label for="relink-game">游戏</label><select id="relink-game"></select><label for="relink-query">寻找收录</label><div class="input-row"><input id="relink-query" required maxlength="256"><button class="secondary">搜索</button></div></form><div id="relink-results" class="results compact"></div><div id="relink-selection"></div><form id="relink-form"><label for="relink-mode">调整方式</label><select id="relink-mode"><option value="merge">合并到同一作品</option><option value="split">将所选收录拆为独立作品</option></select><label for="relink-reason">理由</label><textarea id="relink-reason" required maxlength="2000" rows="2"></textarea><button>提交关系调整申请</button></form></section>
+    </section>
+  </div>
+</main>
+<dialog id="action-dialog"><form id="action-form"><div class="panel-heading"><h2 id="action-title"></h2><button type="button" id="dialog-close" class="quiet" aria-label="关闭对话框">关闭</button></div><p id="action-description" class="muted"></p><div id="action-fields"></div><label for="action-reason">理由 <span class="required">*</span></label><textarea id="action-reason" required maxlength="2000" rows="3"></textarea><div class="button-row"><button type="button" id="dialog-cancel" class="secondary">取消</button><button id="action-submit">确认</button></div><p id="action-error" role="alert"></p></form></dialog>
+<dialog id="detail-dialog"><div class="panel-heading"><h2>请求详情</h2><button id="detail-close" class="quiet" aria-label="关闭请求详情">关闭</button></div><div id="detail-content"></div></dialog>
+<footer>别名提交人工审核 · 保留来源与操作记录</footer>
+</body></html>
