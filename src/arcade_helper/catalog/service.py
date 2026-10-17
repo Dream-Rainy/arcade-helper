@@ -430,10 +430,10 @@ class SongCatalogService:
         # Finish fact reads before imports can occupy the shared SQLite connection.
         for game in missing:
             self._start_catalog_task(game)
-        if unavailable and not result.candidates:
-            raise CatalogSyncError(f"Catalogs initializing or unavailable: {', '.join(unavailable)}; retry or await prepare_catalogs()")
+        if missing and not result.candidates:
+            raise CatalogSyncError(f"Catalogs initializing or unavailable: {', '.join(missing)}; retry or await prepare_catalogs()")
         if unavailable:
-            result = (replace(result, inferred_game=None, resolution="ambiguous", inference_reason="catalog_incomplete",
+            result = (replace(result, inferred_game=None, resolution="ambiguous" if result.candidates else "unknown", inference_reason="catalog_incomplete",
                               unavailable_games=tuple(unavailable)) if game_code is None else
                       replace(result, unavailable_games=tuple(unavailable)))
         return result

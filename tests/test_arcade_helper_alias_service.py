@@ -281,6 +281,46 @@ async def test_catalog_preparation_singleflight_failures_and_shutdown(catalog, t
         await warmed.lifecycle.stop()
 
 
+async def test_usable_partial_catalog_does_not_turn_misses_into_global_failures(catalog):
+    from arcade_helper import ArcadeHelperClient
+    from arcade_helper.games.arcade_songs import ARCADE_SONGS_SITES_URL
+
+    store, _ = catalog
+    # The public taiko source contains a row with both songId and title empty.
+    report = await store.import_arcade_catalog("taiko", {"songs": [
+        {"songId": "drum", "title": "Drum Ready Song", "artist": None, "sheets": []},
+        {"songId": "", "title": "", "artist": None, "sheets": []},
+    ]})
+    assert report.outcome == "partial" and report.available_song_count == 1 and report.invalid
+    await store.import_arcade_catalog("sdvx", {"songs": [
+        {"songId": "voltage", "title": "Voltage Ready Song", "artist": "Artist", "sheets": []},
+    ]})
+    calls = []
+    async def get_json(url, **kwargs):
+        calls.append(url)
+        assert url == ARCADE_SONGS_SITES_URL, "Searching usable data must not refetch a broken source"
+        return [{"gameCode": game, "dataSourceUrl": f"https://fixture.test/{game}"} for game in ("taiko", "sdvx")]
+    client = ArcadeHelperClient(http_get_json=get_json, catalog_store=store)
+    await client.lifecycle.start()
+    try:
+        for lookup in (client.catalog.search_all, client.catalog.resolve_alias):
+            miss = await lookup("NONEXISTENT_DIAGNOSTIC_QUERY_1362")
+            assert not miss.candidates and miss.resolution == "unknown"
+            assert miss.unavailable_games == ("taiko",) and miss.inferred_game is None
+            assert miss.inference_reason == "catalog_incomplete"
+        explicit = await client.catalog.search_all("NONEXISTENT_DIAGNOSTIC_QUERY_1362", game_code="taiko")
+        assert not explicit.candidates and explicit.unavailable_games == ("taiko",)
+        for query, game in (("Drum Ready Song", "taiko"), ("Voltage Ready Song", "sdvx")):
+            found = await client.catalog.search_all(query, text_only=True)
+            assert {candidate.game_code for candidate in found.candidates} == {game}
+            assert found.inferred_game is None and found.unavailable_games == ("taiko",)
+        assert (await store.get_import("taiko"))["invalid"] == report.invalid
+        assert await store.get_sync_version("taiko") == report.sync_version
+        assert calls == [ARCADE_SONGS_SITES_URL]
+    finally:
+        await client.lifecycle.stop()
+
+
 async def test_first_import_race_between_independent_catalog_connections(catalog):
     from arcade_helper import ArcadeHelperClient
     from arcade_helper.games.arcade_songs import ARCADE_SONGS_SITES_URL
