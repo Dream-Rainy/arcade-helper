@@ -32,6 +32,7 @@ MapSyncCallback = Callable[[dict], Awaitable[object]]
 class MaimaiCatalogResult:
     songs: dict[int, MaiSongData]
     data_version: dict[str, Any]
+    dxrating_payload: dict | None = None
 
 
 _DEFAULT_JACKET_IMAGE_NAME = "jacket/UI_Jacket_000000.png"
@@ -286,6 +287,7 @@ def _merge_dxrating_and_lxns(
                 sheet["internalLevelValue"] = lxns_internal if lxns_internal is not None else dx_internal_level_value
 
         merged_song = {
+            "songId": song_id_from_dx,
             "title": title,
             "artist": dx_song.get("artist") or "",
             "bpm": dx_song.get("bpm") or 0,
@@ -368,6 +370,28 @@ def _merge_dxrating_and_lxns(
                                         for text in dxrating_aliases_by_song_id.get(song_id_from_dx, [])]
 
         merged_songs[song_model.id] = song_model
+
+    # LXNS-only entries have real IDs and must not depend on DXRating listing them.
+    labels = ("basic", "advanced", "expert", "master", "remaster")
+    for song_id, source in lxns_by_id.items():
+        if song_id in merged_songs or not source.get("title"):
+            continue
+        difficulties = {}
+        for bucket, rows in (source.get("difficulties") or {}).items():
+            converted = []
+            for row in rows or []:
+                difficulty = row.get("difficulty")
+                name = labels[difficulty] if type(difficulty) is int and 0 <= difficulty < len(labels) else str(difficulty or "utage")
+                converted.append(MaiSongSheet(type="std" if bucket == "standard" else bucket,
+                    difficulty=name, level=str(row.get("level") or ""),
+                    level_value=row.get("level_value"), internal_level_value=row.get("level_value"),
+                    note_designer=row.get("note_designer"), note_counts=row.get("notes"),
+                    regions={"cn": True}, is_buddy=bool(row.get("is_buddy", False))))
+            difficulties[bucket] = converted
+        merged_songs[song_id] = MaiSongData(id=song_id, title=source["title"], artist=source.get("artist") or "",
+            bpm=source.get("bpm") or 0, version=str(source["version"]) if source.get("version") is not None else None,
+            rights=source.get("rights"), mai_map=source.get("map"), difficulties=difficulties,
+            image_name=build_maimai_jacket_image_name(song_id))
 
     return merged_songs
 
@@ -664,7 +688,7 @@ async def fetch_maimai_catalog(
     # 6. 附加 LXNS + 柚子查别名
     await _attach_lxns_yuzuchan_aliases(context, merged_songs)
 
-    return MaimaiCatalogResult(songs=merged_songs, data_version=data_version)
+    return MaimaiCatalogResult(songs=merged_songs, data_version=data_version, dxrating_payload=dxrating_data)
 
 
 __all__ = [

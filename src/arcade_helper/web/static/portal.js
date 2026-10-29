@@ -4,7 +4,7 @@ let authVersion = 0;
 const state = {me:null, song:null, selectedSongId:null, cursors:{}, lists:{}, relink:new Map(), mapping:null};
 const ops = {ADD_ALIAS:"新增别名",RETRACT_EVIDENCE:"撤回来源证据",REPLACE_ALIAS:"替换别名",BLOCK_ALIAS:"屏蔽别名",UNBLOCK_ALIAS:"恢复别名",RELINK_GAME_SONGS:"调整作品关系",MAP_SOURCE_RECORD:"来源记录映射"};
 const statuses = {pending:"待审核",approved:"已通过",rejected:"已拒绝",withdrawn:"已撤回",superseded:"已替代"};
-const reasons = {possible_rename:"疑似改名",duplicate_identity:"身份重复",duplicate_source_record_key:"来源编号重复",variant_changed:"音乐或谱面版本变化",incomplete_identity:"身份信息不足",retired_identity:"历史身份重新出现",approved_mapping_changed:"已批准的映射变化",source_record_changed:"来源原文变化",title_artist:"标题或作者相近"};
+const reasons = {possible_rename:"疑似改名",duplicate_identity:"身份重复",duplicate_source_record_key:"来源编号重复",variant_changed:"音乐或谱面版本变化",incomplete_identity:"身份信息不足",retired_identity:"历史身份重新出现",approved_mapping_changed:"已批准的映射变化",source_record_changed:"来源原文变化",title_artist:"标题或作者相近",chart_variants:"同游戏、同曲名和作者的谱面变体",variant_or_uncertain:"音乐版本或关系需要确认"};
 const el = (tag,text,cls) => {const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e;};
 const notice = (text,error=false) => {$("notice").textContent=text;$("notice").className=error?"error":"";$("notice").hidden=false;};
 const clear = node => node.replaceChildren();
@@ -67,12 +67,12 @@ async function signedIn(me){authVersion++;state.me=me;$("login").hidden=true;$("
 function switchView(view){for(const section of ["submit","review","match"]){$("view-"+section).hidden=section!==view;document.querySelector(`[data-view="${section}"]`)?.setAttribute("aria-current",section===view?"page":"false");}}
 bind($("logout"),"click",async()=>{await api("logout",{});signedOut();window.aliasRelay.socket.close();notice("已退出登录。请私聊机器人重新获取编辑链接。");});
 for(const tab of document.querySelectorAll("[data-view]"))bind(tab,"click",async()=>{const view=tab.dataset.view;switchView(view);if(view==="review")await loadRequests("review");if(view==="match")await Promise.all([loadCandidates(),loadImports()]);});
-function songCard(song){const box=el("div",undefined,"song-meta");const tags=el("div",undefined,"tags");tags.append(badge(song.game_code||"未知游戏"),badge("ID "+(song.public_id??song.id??song.game_song_id)));if(song.active===false)tags.append(badge("已下架","withdrawn"));box.append(tags,el("h3",song.title||"未知乐曲"),el("div",song.artist||"作者未提供","muted"));const markers=Array.isArray(song.chart_variant)?song.chart_variant.join(" · "):song.chart_variant;if(markers)box.append(el("p","谱面标记："+markers,"hint"));return box;}
+function songCard(song){const box=el("div",undefined,"song-meta");const tags=el("div",undefined,"tags");tags.append(badge(song.game_code||"未知游戏"),badge("ID "+(song.public_id??song.id??song.game_song_id)));if(song.active===false)tags.append(badge("已下架","withdrawn"));box.append(tags,el("h3",song.title||"未知乐曲"),el("div",song.artist||"作者未提供","muted"));const markers=Array.isArray(song.chart_variant)?song.chart_variant.join(" · "):song.chart_variant;if(markers)box.append(el("p","谱面标记："+markers,"hint"));if(song.marker_aliases?.length)box.append(el("p","搜索标记："+song.marker_aliases.join("、"),"hint"));return box;}
 function resultButton(song,onPick){const b=button("",()=>onPick(song),"result");b.append(badge(song.game_code),el("strong",song.title),el("span",[song.artist||"作者未提供","ID "+song.public_id,song.matched_text&&song.matched_text!==song.title?"命中 "+song.matched_text:""].filter(Boolean).join(" · "),"muted"));return b;}
 let searchVersion=0;
 bind($("song-search"),"submit",async()=>{const version=++searchVersion;$("search-summary").textContent="正在搜索…";clear($("song-results"));try{const data=await api("search?"+new URLSearchParams({q:$("song-query").value.trim(),game:$("game-filter").value}));if(version!==searchVersion)return;$("search-summary").textContent=data.items.length?`找到 ${data.total} 个收录${data.total>50?"，显示前 50 个，请缩小查询范围":""}`:"未找到匹配的乐曲。";if(data.unavailable_games.length)$("search-summary").textContent+=" 暂不可用："+data.unavailable_games.join("、");for(const song of data.items)$("song-results").append(resultButton(song,()=>selectSong(song.id)));}catch(e){if(e.obsolete)throw e;$("search-summary").textContent="搜索未完成。";throw e;}});
 let selectionVersion=0;
-async function selectSong(id){const version=++selectionVersion;state.selectedSongId=id;state.song=null;$("song-selected").hidden=true;$("selection-empty").hidden=false;$("selection-empty").textContent="正在读取收录和别名来源…";const data=await api("songs/"+id);if(version!==selectionVersion)return;state.song=data;$("selection-empty").hidden=true;$("song-selected").hidden=false;$("selected-info").replaceChildren(songCard(data.song));if(data.music_variant)$("selected-info").append(el("p","音乐版本："+data.music_variant,"hint"));$("linked-entries").replaceChildren(...data.entries.map(songCard));$("alias-origin").options[0].textContent="来自 "+data.song.game_code;renderEvidence(data);resetAliasKey();}
+async function selectSong(id){const changed=state.selectedSongId!==id;const version=++selectionVersion;state.selectedSongId=id;state.song=null;$("song-selected").hidden=true;$("selection-empty").hidden=false;$("selection-empty").textContent="正在读取收录和别名来源…";const data=await api("songs/"+id);if(version!==selectionVersion)return;state.song=data;if(changed)$("alias-scope").value=data.song.chart_variant?.length?"game_song":"work";$("selection-empty").hidden=true;$("song-selected").hidden=false;$("selected-info").replaceChildren(songCard(data.song));if(data.music_variant)$("selected-info").append(el("p","音乐版本："+data.music_variant,"hint"));$("linked-entries").replaceChildren(...data.entries.map(songCard));$("alias-origin").options[0].textContent="来自 "+data.song.game_code;renderEvidence(data);resetAliasKey();}
 function renderEvidence(data){const container=$("evidence-list");container.replaceChildren(el("h3","已有别名与来源"));const evidence=data.evidence.filter(e=>e.kind==="alias");if(!evidence.length)container.append(el("p","暂无别名。","hint"));for(const e of evidence){const row=el("div",undefined,"evidence");row.append(el("strong",e.text),el("div",`${e.source_key} · ${e.origin_game||"通用来源"} · ${e.scope==="work"?"作品共享":"单一收录"}${e.effective?"":" · 当前未生效"}`,"hint"));if(state.me.admin){const actions=el("div",undefined,"actions");actions.append(button("撤回此证据",()=>operation("RETRACT_EVIDENCE",{evidence_id:e.id},"撤回来源证据",e.text)),button("替换",()=>replacement(e,data.song)),button(e.effective?"屏蔽此别名":"恢复此别名",()=>operation(e.effective?"BLOCK_ALIAS":"UNBLOCK_ALIAS",{game_song_id:data.song.id,text:e.text},e.effective?"屏蔽别名":"恢复别名","作用于整个作品；通过审核后生效。")));row.append(actions);}container.append(row);}}
 let aliasKey=crypto.randomUUID();function resetAliasKey(){aliasKey=crypto.randomUUID();}
 $("alias-form").addEventListener("input",resetAliasKey);
@@ -95,8 +95,46 @@ for(const id of ["dialog-close","dialog-cancel"])bind($(id),"click",()=>$("actio
 bind($("action-form"),"submit",async()=>{const reason=$("action-reason").value.trim();if(actionNeedsReason&&!reason){$("action-error").textContent="请填写理由。";return;}try{$("notice").hidden=true;$("notice").textContent="";await actionCallback(reason);$("action-dialog").close();if($("notice").hidden)notice("操作已完成。");}catch(e){if(e.obsolete)return;$("action-error").textContent=e.message+(e.status===409?" 请关闭窗口、刷新详情后重试。":"");}});
 function reviewAction(r,approve){let checkbox=null;const fields=el("div");fields.append(el("p","影响游戏："+r.affected_games.join("、"),"hint"));if(r.stale){const label=el("label",undefined,"check-row");checkbox=el("input");checkbox.type="checkbox";checkbox.required=true;label.append(checkbox,el("span","我已核对目标变化，确认按当前版本审核。"));fields.append(label);}openAction(approve?"通过此申请":"拒绝此申请",`#${r.id} · ${requestLabel(r)}`,fields,async reason=>{const body={version:r.version,approve,reason};if(r.stale){if(!checkbox.checked)throw new Error("请先确认目标变化。");body.confirmed_target_versions=r.current_target_versions;}await api(`requests/${r.id}/review`,body);$("detail-dialog").close();clear($("review-detail"));const refreshes=[loadRequests("review"),loadRequests("my")];if(state.selectedSongId)refreshes.push(selectSong(state.selectedSongId));refreshAfterWrite(...refreshes);});}
 function operation(op,payload,title,description,fields=null){const key=crypto.randomUUID();openAction(title,description,fields,async reason=>{const data=await api("requests",{operation:op,payload:typeof payload==="function"?payload():payload,reason,idempotency_key:key});notice(`已提交请求 #${data.id}，由另一位管理员审核后生效。`);refreshAfterWrite(loadRequests("my"));});}
-function replacement(e,song){const fields=el("div");const label=el("label","新别名");const input=el("input");input.required=true;input.maxLength=256;input.value=e.text;label.append(input);fields.append(label,el("p","范围及来源沿用此证据。","hint"));operation("REPLACE_ALIAS",()=>({evidence_id:e.id,game_song_id:e.anchor_id,text:input.value.trim(),scope:e.scope,origin_game:e.origin_game}),"替换别名","替换原证据，并生成新别名证据；通过审核后生效。",fields);}
-async function loadCandidates(more=false){const version=(state.lists.candidates||0)+1;state.lists.candidates=version;if(!more)$("candidate-more").hidden=true;const data=await api("candidates?after="+(more?state.cursors.candidates||0:0)).catch(error=>{if(version!==state.lists.candidates)error.obsolete=true;throw error;});if(version!==state.lists.candidates)return;if(!more)clear($("candidate-list"));if(!data.items.length&&!more)$("candidate-list").append(el("div","暂无待确认的跨游戏候选。","empty"));for(const row of data.items){const card=el("div",undefined,"candidate");card.append(badge("候选 #"+row.id),el("p","匹配依据："+(reasons[row.reason]||row.reason),"hint"));const compare=el("div",undefined,"compare");for(const s of row.songs)if(s)compare.append(songCard(s));card.append(compare);if(row.stale)card.append(el("p","歌曲版本已变化，请重新计算匹配。","warning"));const actions=el("div",undefined,"button-row");for(const [accept,text] of [[true,"确认同一音乐"],[false,"不是同一音乐"]]){const b=button(text,()=>openAction(text,"核对作者和音乐版本后填写理由。",null,async reason=>{await api(`candidates/${row.id}/decide`,{version:row.version,approve:accept,reason});refreshAfterWrite(loadCandidates());}),accept?"":"secondary");b.disabled=row.stale;actions.append(b);}card.append(actions);$("candidate-list").append(card);}state.cursors.candidates=data.next_cursor;$("candidate-more").hidden=!data.has_more;}
+function replacement(e,song){const fields=el("div");const label=el("label","新别名");const input=el("input");input.required=true;input.maxLength=256;input.value=e.source_text??e.text;label.append(input);fields.append(label,el("p","范围及来源沿用此证据。","hint"));operation("REPLACE_ALIAS",()=>({evidence_id:e.id,game_song_id:e.anchor_id,text:input.value.trim(),scope:e.scope,origin_game:e.origin_game}),"替换别名","替换原证据，并生成新别名证据；通过审核后生效。",fields);}
+async function loadCandidates(more=false){
+  const version=(state.lists.candidates||0)+1;state.lists.candidates=version;
+  if(!more)$("candidate-more").hidden=true;
+  const data=await api("candidates?after="+(more?state.cursors.candidates||0:0)).catch(error=>{if(version!==state.lists.candidates)error.obsolete=true;throw error;});
+  if(version!==state.lists.candidates)return;
+  if(!more)clear($("candidate-list"));
+  if(!data.items.length&&!more)$("candidate-list").append(el("div","暂无待确认的音乐关联候选。","empty"));
+  for(const row of data.items){
+    const card=el("div",undefined,"candidate"),fields=new Map();
+    card.append(badge("候选 #"+row.id+" · "+row.songs.length+" 个收录"),el("p","匹配依据："+(reasons[row.reason]||row.reason),"hint"));
+    const compare=el("div",undefined,"compare");
+    for(const song of row.songs)if(song){
+      const box=songCard(song);
+      if(song.chart_variant?.length){
+        const label=el("label","新增搜索标记（可选）"),input=el("input");
+        input.maxLength=512;input.placeholder="例如：宴、派对";input.dataset.markerSong=String(song.id);
+        input.disabled=row.stale;label.append(input);box.append(label);fields.set(song.id,{input,title:song.title});
+      }
+      compare.append(box);
+    }
+    card.append(compare);
+    if(fields.size)card.append(el("p","多个标记用逗号分隔；仅用于搜索，保留原谱面标记。确认本组时一起保存。","hint"));
+    if(row.stale)card.append(el("p","歌曲版本已变化，请重新计算匹配。","warning"));
+    const actions=el("div",undefined,"button-row");
+    for(const [accept,text] of [[true,row.songs.length>2?"确认本组同一音乐":"确认同一音乐"],[false,row.songs.length>2?"拒绝本组关联":"不是同一音乐"]]){
+      const b=button(text,()=>{
+        const markers={},preview=[];
+        if(accept)for(const [id,field] of fields){const labels=field.input.value.split(/[，,、\n]+/).map(s=>s.trim()).filter(Boolean);if(labels.length){markers[id]=labels;preview.push(field.title+"："+labels.join("、"));}}
+        return openAction(text,"核对本组全部收录的作者和音乐版本后填写理由，确认会关联组内全部作品。"+(preview.length?" 新增搜索标记："+preview.join("；"):""),null,async reason=>{
+          await api(`candidates/${row.id}/decide`,{version:row.version,approve:accept,reason,...(accept?{marker_aliases:markers}:{})});
+          refreshAfterWrite(loadCandidates());
+        });
+      },accept?"":"secondary");
+      b.disabled=row.stale;actions.append(b);
+    }
+    card.append(actions);$("candidate-list").append(card);
+  }
+  state.cursors.candidates=data.next_cursor;$("candidate-more").hidden=!data.has_more;
+}
 bind($("candidate-refresh"),"click",()=>loadCandidates());bind($("candidate-more"),"click",()=>loadCandidates(true));
 bind($("associate-open"),"click",()=>openAction("重新计算曲库匹配","会自动关联规则明确确认的同一音乐，并重新生成需要人工确认的候选。",null,async()=>{await api("associate",{});refreshAfterWrite(loadCandidates());},false));
 async function loadImports(){const rows=await api("imports");clear($("import-list"));if(!rows.length)$("import-list").append(el("p","当前没有 arcade-songs 导入记录。","hint"));for(const r of rows){const b=button("",()=>loadPending(r),"import-card");b.append(el("strong",r.game_code),el("p",`可用 ${r.available} · 待定 ${r.pending}`,"hint"),badge("数据集 v"+r.sync_version));$("import-list").append(b);}}

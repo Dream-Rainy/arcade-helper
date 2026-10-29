@@ -95,6 +95,7 @@ class TortoiseCatalogStore:
         namespace: str = "default", expected_sync_version: int | None = None,
         invalid: list[str] | None = None, dry_run: bool = False, allow_empty: bool = False,
         raw_payload: Any = None, complete: bool = True, expected_alias_versions: dict | None = None, alias_complete: bool = False,
+        bindings: dict[str, int] | None = None,
     ) -> CatalogImportReport:
         """Publish certain rows; defer removals if any identity is unresolved.
 
@@ -124,6 +125,10 @@ class TortoiseCatalogStore:
             sync_version = previous.sync_version if previous else 0
             if expected_sync_version is not None and sync_version != expected_sync_version:
                 raise CatalogConflictError("Dataset changed during fetch; refetch and retry")
+            bound_songs = {song.id: song for song in await GameSong.filter(
+                id__in=set((bindings or {}).values()), game_code=game_code, active=True).using_db(db)} if bindings else {}
+            if bindings and set(bindings.values()) != set(bound_songs):
+                raise ValueError("Bindings must reference active entries in the same game")
             report = CatalogImportReport(game_code, revision, dry_run=dry_run, invalid=list(invalid or []), sync_version=sync_version)
             report.source_record_count = (len(raw_payload["songs"]) if isinstance(raw_payload, dict) and isinstance(raw_payload.get("songs"), list)
                                           else len(records))
@@ -235,7 +240,7 @@ class TortoiseCatalogStore:
                         reason = "incomplete_identity"
                     elif ref is not None and not ref.present and record.key_kind == "derived":
                         reason = "retired_identity"
-                    elif ref is None and record.key_kind == "derived" and any(
+                    elif ref is None and record.external_key not in (bindings or {}) and record.key_kind == "derived" and any(
                         old.identity_material["title"] == identity["title"]
                         or (identity["artist"] and old.identity_material.get("artist") == identity["artist"])
                         for old in missing
@@ -271,19 +276,24 @@ class TortoiseCatalogStore:
                         payload.pop(field, None)
                     payload["chart_variant"] = identity["chart_variant"]
                     if ref is None:
-                        report.created += 1
+                        target = (bindings or {}).get(record.external_key)
+                        report.updated += int(target is not None)
+                        report.created += int(target is None)
                         changed = True
                         if dry_run:
                             continue
-                        work = await MusicWork.create(
-                            display_title=parse_chart_title(record.song.title, literal=identity["chart_variant"] == [])[0],
-                            artist=record.song.artist, using_db=db,
-                        )
-                        song = await GameSong.create(
-                            work=work, game_code=game_code, title=record.song.title,
-                            artist=record.song.artist, chart_variant=identity["chart_variant"],
-                            catalog_payload=payload, edition_key=content_key(record.source_record_key) if record.source_record_key else "", using_db=db,
-                        )
+                        if target is not None:
+                            song = bound_songs[target]
+                        else:
+                            work = await MusicWork.create(
+                                display_title=parse_chart_title(record.song.title, literal=identity["chart_variant"] == [])[0],
+                                artist=record.song.artist, using_db=db,
+                            )
+                            song = await GameSong.create(
+                                work=work, game_code=game_code, title=record.song.title,
+                                artist=record.song.artist, chart_variant=identity["chart_variant"],
+                                catalog_payload=payload, edition_key=content_key(record.source_record_key) if record.source_record_key else "", using_db=db,
+                            )
                         ref = await SongReference.create(
                             game_song=song, provider=provider, namespace=namespace, game_code=game_code,
                             reference_key=key, external_key=record.external_key, key_kind=record.key_kind,
@@ -332,9 +342,10 @@ class TortoiseCatalogStore:
                 batch_ids = affected_ids[offset:offset + 256]
                 # Each source keeps its own observation; projection order is deterministic.
                 selected = {}
-                for row in await SongReference.filter(game_song_id__in=batch_ids, present=True).using_db(db).order_by(
+                observations = await SongReference.filter(game_song_id__in=batch_ids, present=True).using_db(db).order_by(
                     "provider", "namespace", "reference_key",
-                ).values("game_song_id", "payload", "identity_material"):
+                ).values("game_song_id", "payload", "identity_material", "provider", "namespace")
+                for row in sorted(observations, key=lambda r: (r["provider"], r["namespace"]) != ("catalog", "native")):
                     selected.setdefault(row["game_song_id"], row)
                 await GameSong.filter(id__in=set(batch_ids) - selected.keys(), active=True).using_db(db).update(active=False, version=F("version") + 1)
                 current_rows = await GameSong.filter(id__in=list(selected)).using_db(db).values("id", "title", "artist", "chart_variant", "active", "version", "work_id")
@@ -515,6 +526,30 @@ class TortoiseCatalogStore:
                 return songs
         raise CatalogConflictError("Catalog changed repeatedly while loading metadata; retry")
 
+    async def reference_bindings(self, game_code, records, *, provider, namespace="default", exclude_native=False):
+        """Reuse a source's identity only for one-to-one, exact same-game matches."""
+        def signature(identity, payload):
+            difficulties = payload.get("difficulties", {})
+            special = (any(key in {"we", "worldsend", "utage"} for key in difficulties)
+                       or any(sheet.get("isSpecial") or sheet.get("is_special") for rows in difficulties.values() for sheet in rows)
+                       or str(payload.get("category") or "").upper() == "WORLD'S END")
+            material = {k: v for k, v in identity.items() if k != "source_record_key"}
+            for field in ("title", "artist"):
+                if material.get(field):
+                    material[field] = normalize_width(material[field]).strip()
+            return content_key([material, special])
+        incoming, existing = defaultdict(set), defaultdict(set)
+        for record in records:
+            incoming[signature(record.identity, record.song.model_dump(mode="json"))].add(record.external_key)
+        excluded = set(await SongReference.filter(game_code=game_code, provider="catalog", namespace="native", present=True).using_db(
+            self._db).values_list("game_song_id", flat=True)) if exclude_native else set()
+        for row in await SongReference.filter(game_code=game_code, provider=provider, namespace=namespace,
+                present=True, game_song__active=True).using_db(self._db).values("game_song_id", "identity_material", "payload"):
+            if row["game_song_id"] not in excluded:
+                existing[signature(row["identity_material"], row["payload"])].add(row["game_song_id"])
+        return {next(iter(keys)): next(iter(existing[key])) for key, keys in incoming.items()
+                if len(keys) == 1 and len(existing[key]) == 1}
+
     async def get_search_songs_by_ids(self, game_code: str, song_ids: list[int] | None = None) -> dict[int, SongData]:
         """Text-only metadata for alias-enabled catalogs; legacy JSON fallback."""
         cached = self._search_songs_cache.get(game_code)
@@ -533,9 +568,12 @@ class TortoiseCatalogStore:
         songs = {r["id"]: SongData(**{**r, "game_song_id": r["id"], "work_id": str(r["work_id"])}) for r in rows}
         if self.enable_aliases:
             from .alias_store import TortoiseAliasStore
-            projection = await TortoiseAliasStore(self)._alias_texts(game_code, song_ids=list(songs))
+            aliases = TortoiseAliasStore(self)
+            projection = await aliases._alias_texts(game_code, song_ids=list(songs))
+            markers = await aliases.get_marker_aliases(list(songs))
             for sid, song in songs.items():
                 song.aliases = projection[sid]
+                song.marker_aliases = tuple(markers.get(sid, ()))
         return songs
 
     async def query_title_exact(self, game_code: str, title: str) -> list[tuple[int, str]]:

@@ -17,7 +17,7 @@ from rapidfuzz import fuzz, process
 
 from arcade_helper.core.errors import ArcadeHelperError
 from arcade_helper.core.song import SongData
-from arcade_helper.core.song_identity import parse_chart_title
+from arcade_helper.core.song_identity import parse_chart_title, expand_chart_query
 from arcade_helper.search.models import MatchType, SongQueryResult
 from .constants import (
     ALIAS_CACHE_TTL_SECONDS,
@@ -154,7 +154,7 @@ def _matches_variant(song: SongData) -> bool:
     if required is None:
         return True
     actual = song.chart_variant if "chart_variant" in song.model_fields_set else parse_chart_title(song.title)[1]
-    return actual is not None and tuple(actual) == required
+    return tuple(actual or ()) == required
 
 
 class SongSearchService:
@@ -166,13 +166,42 @@ class SongSearchService:
         _live_caches.add(self._cache)
         self._locks = {}
 
-    async def _run(self, method, *args, game_code="maimai", hydrate=True, **kwargs):
+    async def _run(self, method, *args, game_code="maimai", hydrate=True, _expanded=False, **kwargs):
         game_code = _normalize_game_code(game_code)
+        if not _expanded and args and isinstance(args[0], str) and not args[0].isdecimal() and method in {
+                search_song, query_song_fuzzy, query_song_by_title_exact, query_song_by_alias_exact}:
+            load = getattr(self.repository, "load_search_songs", self.repository.load_all_songs)
+            songs = await load(game_code)
+            queries = expand_chart_query(args[0], ((song.chart_variant if "chart_variant" in song.model_fields_set
+                else parse_chart_title(song.title)[1], getattr(song, "marker_aliases", ())) for song in songs.values()))
+            if len(queries) > 1:
+                parts = await asyncio.gather(*(self._run(method, text, *args[1:], game_code=game_code,
+                    hydrate=hydrate, _expanded=True, **kwargs) for text in queries))
+                results = {}
+                for text, part in zip(queries, parts):
+                    for row in part:
+                        if text == queries[0] and not row.match_type.value.startswith("exact_"):
+                            continue
+                        song = songs.get(row.song_id)
+                        if text != queries[0] and (song is None or text not in expand_chart_query(args[0], [(
+                                song.chart_variant if "chart_variant" in song.model_fields_set else parse_chart_title(song.title)[1],
+                                getattr(song, "marker_aliases", ()))])):
+                            continue
+                        rank = (row.match_type.value.startswith("exact_"), row.match_score)
+                        old = results.get(row.song_id)
+                        if old is None or rank > (old.match_type.value.startswith("exact_"), old.match_score):
+                            results[row.song_id] = row
+                exact = any(row.match_type.value.startswith("exact_") for row in results.values())
+                return sorted((row for row in results.values() if not exact or row.match_type.value.startswith("exact_")),
+                              key=lambda row: (-row.match_score, row.song_id))
         async with self._locks.setdefault(game_code, asyncio.Lock()):
             token = _repository_var.set(self.repository)
             cache_token = _cache_var.set(self._cache)
             markers = parse_chart_title(args[0])[1] if args and isinstance(args[0], str) else ()
-            variant_token = _variant_var.set(markers or None)
+            required = None
+            if args and isinstance(args[0], str) and not args[0].isdecimal():
+                required = markers
+            variant_token = _variant_var.set(required)
             candidate_token = _candidate_var.set(None)
             try:
                 for _ in range(3):
@@ -188,7 +217,7 @@ class SongSearchService:
                             and song.chart_variant == () and "chart_variant" in song.model_fields_set
                             for song in songs.values()
                         )
-                    _variant_var.set(None if literal else markers or None)
+                    _variant_var.set(() if literal else required)
                     result = await method(*args, game_code=game_code, **kwargs)
                     if hydrate:
                         result = await _hydrate_candidates(result, game_code)
@@ -234,7 +263,7 @@ class SongSearchService:
         """Prewarm without holding the foreground game lock."""
         token = _repository_var.set(self.repository)
         cache_token = _cache_var.set(self._cache)
-        variant_token = _variant_var.set(None)
+        variant_token = _variant_var.set(())
         candidate_token = _candidate_var.set(None)
         try:
             await _get_search_index(game_code, max_age=ALIAS_CACHE_TTL_SECONDS - 30)
@@ -358,7 +387,7 @@ async def _get_alias_cache(
 async def _get_search_index(game_code: str = "maimai", *, max_age=ALIAS_CACHE_TTL_SECONDS) -> _SearchIndex:
     gc = _normalize_game_code(game_code)
     cache = _cache()
-    cache_key = (gc, _variant_var.get())
+    cache_key = (gc, _variant_var.get() or None)
     for _ in range(3):
         generation = await _ensure_generation(gc)
         epoch = cache.epochs[gc]

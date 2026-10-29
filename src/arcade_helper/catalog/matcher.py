@@ -84,7 +84,9 @@ async def match_catalog(db):
         titles[identity_text(base)].append(song)
         exact_titles[song.id], artists[song.id] = identity_text(song.title), identity_text(song.artist)
         members[song.work_id].add(song.id)
-    rejected = {tuple(sorted(pair)) for pair in await WorkCandidate.filter(status="rejected").using_db(db).values_list("left_id", "right_id")}
+    rejected = set()
+    for left, right, versions in await WorkCandidate.filter(status="rejected").using_db(db).values_list("left_id", "right_id", "target_versions"):
+        rejected.update(combinations(sorted({left, right, *map(int, versions)}), 2))
     rejected_neighbors = defaultdict(set)
     for a, b in rejected:
         rejected_neighbors[a].add(b)
@@ -156,13 +158,61 @@ async def match_catalog(db):
             members[target].update(moved)
             await WorkCandidate.filter(pair_key=content_key([a, b])).using_db(db).update(status="accepted")
             merged += 1
-        elif not is_blocked:
-            existing = await WorkCandidate.filter(pair_key=content_key([a, b])).using_db(db).first()
-            versions = {str(a): left.version, str(b): right.version}
-            if existing is None or (existing.status == "pending" and existing.target_versions != versions):
-                await WorkCandidate.update_or_create(pair_key=content_key([a, b]), using_db=db, defaults={
-                    "left_id": a, "right_id": b, "reason": "variant_or_uncertain", "status": "pending",
-                    "target_versions": versions,
-                    "version": existing.version + 1 if existing else 1,
-                })
+
+    families = defaultdict(list)
+    for song in songs:
+        if song.chart_variant is not None and artists[song.id]:
+            base = identity_text(parse_chart_title(song.title, literal=song.chart_variant == [])[0])
+            families[(song.game_code, base, artists[song.id])].append(song)
+    possible = [group for group in families.values()
+                if any(s.chart_variant for s in group) and len({s.work_id for s in group}) > 1]
+    music_versions = {}
+    family_ids = sorted({s.id for group in possible for s in group})
+    for offset in range(0, len(family_ids), 256):
+        for sid, payload in await GameSong.filter(id__in=family_ids[offset:offset + 256]).using_db(db).values_list("id", "catalog_payload"):
+            music_versions[sid] = content_key(payload.get("music_variant"))
+    pending, covered = {}, {}
+    for family in possible:
+        versions_groups = defaultdict(list)
+        for song in family:
+            versions_groups[music_versions[song.id]].append(song)
+        for group in versions_groups.values():
+            markers = defaultdict(set)
+            for song in group:
+                markers[tuple(song.chart_variant)].add(song.work_id)
+            if len({s.work_id for s in group}) < 2 or any(len(works) > 1 for works in markers.values()):
+                continue
+            if any(blocked(a, b) for a, b in combinations(group, 2)):
+                continue
+            ids = sorted({sid for song in group for sid in members[song.work_id]})
+            key = content_key(ids)
+            pending[key] = (ids, "chart_variants")
+            for song in group:
+                covered[song.work_id] = key
+    work_pairs = set()
+    for a, b in sorted(pairs):
+        left, right = by_id[a], by_id[b]
+        if left.work_id == right.work_id or blocked(left, right):
+            continue
+        if left.work_id in covered and covered[left.work_id] == covered.get(right.work_id):
+            continue
+        work_pair = tuple(sorted((left.work_id, right.work_id)))
+        if work_pair in work_pairs:
+            continue
+        work_pairs.add(work_pair)
+        ids = sorted(members[left.work_id] | members[right.work_id])
+        pending[content_key(ids)] = (ids, "variant_or_uncertain")
+    for key, (ids, reason) in pending.items():
+        existing = await WorkCandidate.filter(pair_key=key).using_db(db).first()
+        versions = {str(sid): by_id[sid].version for sid in ids}
+        if existing is None or existing.status == "superseded" or (existing.status == "pending" and existing.target_versions != versions):
+            left = ids[0]
+            right = next(sid for sid in ids if by_id[sid].work_id != by_id[left].work_id)
+            await WorkCandidate.update_or_create(pair_key=key, using_db=db, defaults={
+                "left_id": left, "right_id": right, "reason": reason, "status": "pending",
+                "target_versions": versions, "version": existing.version + 1 if existing else 1,
+            })
+    # Keep audit history while retiring the old pair-by-pair queue.
+    await WorkCandidate.filter(status="pending").exclude(pair_key__in=list(pending)).using_db(db).update(
+        status="superseded", version=F("version") + 1)
     return merged

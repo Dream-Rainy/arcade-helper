@@ -13,17 +13,46 @@ from tortoise.exceptions import DoesNotExist
 from tortoise.transactions import in_transaction
 
 from arcade_helper.aliases.models import (
-    alias_key, AliasConflictError, AliasPermissionError, AliasCandidate, AliasResolution,
+    alias_key, AliasConflictError, AliasPermissionError, AliasCandidate, AliasResolution, merge_alias_resolutions,
 )
 from arcade_helper.catalog.importer import content_key, prepare_arcade_catalog
 from arcade_helper.catalog.matcher import merge_works, split_songs, match_catalog
-from arcade_helper.core.song_identity import normalize_width, parse_chart_title
+from arcade_helper.core.song_identity import normalize_width, parse_chart_title, expand_chart_query
 from .catalog_models import AliasRevision, CatalogImport, GameSong, MusicWork, SongReference
 from .alias_models import AliasSource, AliasEvidence, AliasRule, AliasRequest, AliasEvent, AliasReceipt, WorkCandidate
 
 
 _BATCH_SIZE = 256
 _NOT_LOADED = object()
+
+
+def _alias_search_key(text):
+    base, markers = parse_chart_title(text)
+    return alias_key("".join(f"[{mark}]" for mark in markers) + " " + base) if markers else alias_key(text)
+
+
+def _alias_lookup_keys(texts):
+    keys = set()
+    for text in texts:
+        base, markers = parse_chart_title(text)
+        keys.add(alias_key(text))
+        if markers:
+            keys.add(alias_key(base))
+            for separator in ("", " "):
+                prefix = separator.join(f"[{mark}]" for mark in markers)
+                keys.update((alias_key(prefix + base), alias_key(prefix + " " + base)))
+    return keys
+
+
+def _chart_alias(text, markers):
+    # Namespace effective aliases without rewriting source evidence or its identity.
+    base, existing = parse_chart_title(text)
+    if existing and existing != tuple(markers or ()):
+        return None
+    if not markers:
+        return text
+    text = "".join(f"[{mark}]" for mark in markers) + " " + (base if existing else text)
+    return text if len(text) <= 256 else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +62,7 @@ class _SongIdentity:
     game_code: str
     title: str
     chart_variant: list | None
+    marker_aliases: tuple[str, ...] = ()
 
 
 class TortoiseAliasStore:
@@ -58,7 +88,8 @@ class TortoiseAliasStore:
         generation = (self.catalog._db, revision)
         async with self._identity_lock:
             if self._identity_cache is None or self._identity_cache[0] != generation:
-                rows = [_SongIdentity(*row) for row in await GameSong.filter(active=True).using_db(self.catalog._db).order_by("id").values_list("id", "work_id", "game_code", "title", "chart_variant")]
+                markers = await self.get_marker_aliases()
+                rows = [_SongIdentity(*row, tuple(markers.get(row[0], ()))) for row in await GameSong.filter(active=True).using_db(self.catalog._db).order_by("id").values_list("id", "work_id", "game_code", "title", "chart_variant")]
                 native_ids = dict(await SongReference.filter(provider="catalog", namespace="native", present=True).using_db(self.catalog._db).values_list("game_song_id", "external_key"))
                 titles = {s.id: alias_key(s.title) for s in rows}
                 self._identity_cache = (generation, rows, native_ids, titles)
@@ -119,9 +150,9 @@ class TortoiseAliasStore:
     async def _evidence(self, db, source, anchor, text, *, record_key, scope, kind="alias", actor_id=None, request_id=None, reference_id=None, _existing=_NOT_LOADED, _unchanged_ids=None):
         text = normalize_width(text)
         normalized = alias_key(text)
-        if kind == "title":
+        if kind in {"title", "marker"}:
             scope = "game_song"
-        if scope not in {"work", "game_song"} or kind not in {"alias", "title"}:
+        if scope not in {"work", "game_song"} or kind not in {"alias", "title", "marker"}:
             raise ValueError("Invalid evidence scope/kind")
         key = content_key([source.id, str(record_key), anchor, normalized, scope, kind])
         row = await AliasEvidence.filter(evidence_key=key).using_db(db).first() if _existing is _NOT_LOADED else _existing
@@ -161,9 +192,24 @@ class TortoiseAliasStore:
         legacy_sources = dict(await AliasSource.filter(source_key__startswith="legacy:").using_db(db).values_list("source_key", "id")) if source.trusted_import and source.kind == "external" else {}
         for offset in range(0, len(observations), _BATCH_SIZE):
             batch = observations[offset:offset + _BATCH_SIZE]
+            if source.source_key == "dxrating:maimai":
+                # Keep moderation when DX evidence moves from a native snapshot to its own source.
+                previous = defaultdict(list)
+                for row in await AliasEvidence.filter(source=source, anchor_id__in={o["anchor_id"] for o in batch},
+                        alias_key__in={alias_key(o["text"]) for o in batch}).using_db(db).values(
+                        "anchor_id", "alias_key", "scope", "kind", "source_record_key", "reference_id"):
+                    previous[(row["anchor_id"], row["alias_key"], row["scope"], row["kind"])].append(row)
+                batch = [dict(o) for o in batch]
+                for observation in batch:
+                    kind = observation.get("kind", "alias")
+                    scope = "game_song" if kind in {"title", "marker"} else observation.get("scope", "work")
+                    matches = previous[(observation["anchor_id"], alias_key(observation["text"]), scope, kind)]
+                    if len(matches) == 1:
+                        observation["record_key"] = matches[0]["source_record_key"]
+                        observation["reference_id"] = matches[0]["reference_id"]
             anchors = dict(await GameSong.filter(id__in={o["anchor_id"] for o in batch}).using_db(db).values_list("id", "game_code"))
             keys = [content_key([source.id, str(o["record_key"]), o["anchor_id"], alias_key(o["text"]),
-                                 "game_song" if o.get("kind", "alias") == "title" else o.get("scope", "work"), o.get("kind", "alias")]) for o in batch]
+                                 "game_song" if o.get("kind", "alias") in {"title", "marker"} else o.get("scope", "work"), o.get("kind", "alias")]) for o in batch]
             existing = {row.evidence_key: row for row in await AliasEvidence.filter(evidence_key__in=keys).using_db(db).only(
                 "id", "evidence_key", "source_id", "source_record_key", "anchor_id", "alias_key", "scope", "kind", "reference_id", "raw_text", "remote_state", "version")}
             legacy = defaultdict(list)
@@ -230,7 +276,7 @@ class TortoiseAliasStore:
             title_key = f"catalog:{provider}:{namespace}:{game_code}"
             groups[title_key].append({"anchor_id": anchor, "text": record.song.title, "record_key": record.external_key,
                                       "scope": "game_song", "kind": "title", "reference_id": reference_id})
-            metadata[title_key] = ("catalog", provider in {"catalog", "arcade_songs"})
+            metadata[title_key] = ("catalog", provider in {"catalog", "arcade_songs", "dxrating"})
             completed.add(title_key)
             for observation in record.song.alias_observations:
                 groups[observation.source_key].append({"anchor_id": anchor, "text": observation.text,
@@ -268,37 +314,41 @@ class TortoiseAliasStore:
         query = GameSong.filter(**({"game_code": game_code} if game_code else {}), active=True)
         if song_ids is not None:
             query = query.filter(id__in=song_ids)
-        targets = await query.using_db(db).values_list("id", "work_id")
+        targets = await query.using_db(db).values_list("id", "work_id", "chart_variant")
         if not targets:
             return {}
-        works = {work for _, work in targets}
+        works = {work for _, work, _ in targets}
         rules = set(await AliasRule.filter(work_id__in=works, blocked=True).using_db(db).values_list("work_id", "alias_key"))
-        evidence_query = AliasEvidence.filter(anchor__work_id__in=works)
+        evidence_query = AliasEvidence.filter(anchor__work_id__in=works, kind__in=["alias", "title"])
         if alias_keys is not None:
-            evidence_query = evidence_query.filter(alias_key__in=alias_keys)
-        fields = ["id", "anchor_id", "anchor__work_id", "scope", "alias_key", "raw_text"]
+            evidence_query = evidence_query.filter(alias_key__in=_alias_lookup_keys(alias_keys))
+        fields = ["id", "anchor_id", "anchor__work_id", "scope", "alias_key", "raw_text", "kind"]
         if not include_inactive:
             evidence_query = evidence_query.filter(source__enabled=True, remote_state="present", moderation_state="accepted")
         if texts:
             evidence_query = evidence_query.filter(kind="alias")
         else:
-            fields += ["kind", "request_id", "remote_state", "moderation_state", "version", "source__source_key", "source__origin_game", "source__kind", "source__enabled"]
+            fields += ["request_id", "remote_state", "moderation_state", "version", "source__source_key", "source__origin_game", "source__kind", "source__enabled"]
         evidence = await evidence_query.using_db(db).order_by("id").values(*fields)
         by_work = defaultdict(list)
         for row in evidence:
             by_work[row["anchor__work_id"]].append(row)
-        result = {sid: [] for sid, _ in targets}
-        for sid, work in targets:
+        result = {sid: [] for sid, _, _ in targets}
+        for sid, work, markers in targets:
             for row in by_work[work]:
                 if row["scope"] == "game_song" and row["anchor_id"] != sid:
                     continue
-                effective = (not include_inactive or (row["source__enabled"] and row["remote_state"] == "present" and row["moderation_state"] == "accepted")) and (work, row["alias_key"]) not in rules
+                text = _chart_alias(row["raw_text"], markers) if row["kind"] == "alias" else row["raw_text"]
+                if text is None:
+                    continue
+                key = _alias_search_key(text) if row["kind"] == "alias" else row["alias_key"]
+                effective = (not include_inactive or (row["source__enabled"] and row["remote_state"] == "present" and row["moderation_state"] == "accepted")) and (work, row["alias_key"]) not in rules and (work, key) not in rules
                 if effective or include_inactive:
                     if texts:
-                        result[sid].append(row["raw_text"])
+                        result[sid].append(text)
                     else:
                         source_kind = row["source__kind"]
-                        result[sid].append({"id": row["id"], "text": row["raw_text"], "alias_key": row["alias_key"],
+                        result[sid].append({"id": row["id"], "text": text, "source_text": row["raw_text"], "alias_key": key,
                             "kind": row["kind"], "scope": row["scope"], "anchor_id": row["anchor_id"],
                             "source_key": row["source__source_key"], "origin_game": row["source__origin_game"],
                             "source_kind": source_kind, "request_id": row["request_id"],
@@ -309,16 +359,17 @@ class TortoiseAliasStore:
 
     async def query_exact(self, game_code, text, *, kind="alias"):
         """Read only matching evidence, preserving work scope and moderation."""
-        normalized = alias_key(text)
-        works = await AliasEvidence.filter(alias_key=normalized, kind=kind).using_db(
+        normalized = _alias_search_key(text) if kind == "alias" else alias_key(text)
+        keys = _alias_lookup_keys([text])
+        works = await AliasEvidence.filter(alias_key__in=keys, kind=kind).using_db(
             self.catalog._db
         ).values_list("anchor__work_id", flat=True)
         targets = await GameSong.filter(game_code=game_code, active=True, work_id__in=works).using_db(
             self.catalog._db
         ).values_list("id", flat=True)
-        projection = await self.projection(_song_ids=targets, _alias_keys=[normalized])
+        projection = await self.projection(_song_ids=targets, _alias_keys=keys)
         return list({song_id: e["text"] for song_id, evidence in projection.items()
-                     for e in evidence if e["kind"] == kind}.items())
+                     for e in evidence if e["kind"] == kind and e["alias_key"] == normalized}.items())
 
     async def get_effective_aliases(self, game_song_id, *, include_inactive=False, actor_id=None):
         if include_inactive:
@@ -338,8 +389,56 @@ class TortoiseAliasStore:
                 return deepcopy(result)
         raise AliasConflictError("Catalog changed repeatedly during alias lookup")
 
-    async def _search(self, query, game_code=None, *, aliases_only=False, text_only=False):
+    async def get_marker_aliases(self, song_ids=None):
+        query = AliasEvidence.filter(kind="marker", source__enabled=True, remote_state="present", moderation_state="accepted")
+        if song_ids is not None:
+            query = query.filter(anchor_id__in=song_ids)
+        result = defaultdict(list)
+        for sid, text in await query.using_db(self.catalog._db).order_by("id").values_list("anchor_id", "raw_text"):
+            if text not in result[sid]:
+                result[sid].append(text)
+        return dict(result)
+
+    async def expand_query(self, query, *, game_code=None):
+        rows, _, _ = await self._identity_snapshot(await self.catalog.get_revision())
+        return expand_chart_query(str(query), ((s.chart_variant, s.marker_aliases) for s in rows
+                                  if not game_code or s.game_code == game_code))
+
+    async def _search(self, query, game_code=None, *, aliases_only=False, text_only=False, _expanded=False):
+        catalog_id = str(query).casefold().startswith("catalog:") and str(query)[8:].isdecimal()
+        if not _expanded and isinstance(query, str) and not query.isdecimal() and not catalog_id:
+            for _ in range(3):
+                before = await self.catalog.get_revision()
+                self._read_generation(before)
+                expanded_key = ("expanded", query, game_code, aliases_only, text_only)
+                if expanded_key in self._resolution_cache:
+                    return self._resolution_cache[expanded_key]
+                rows, _, _ = await self._identity_snapshot(before)
+                queries = expand_chart_query(query, ((s.chart_variant, s.marker_aliases) for s in rows
+                                             if not game_code or s.game_code == game_code))
+                if len(queries) == 1:
+                    raw_key = (str(query), game_code, aliases_only, text_only)
+                    if raw_key in self._resolution_cache:
+                        return self._resolution_cache[raw_key]
+                    break
+                results = await asyncio.gather(*(self._search(text, game_code, aliases_only=aliases_only,
+                    text_only=text_only, _expanded=True) for text in queries))
+                results[0] = replace(results[0], candidates=tuple(c for c in results[0].candidates if c.match_type.startswith("exact_")))
+                for index, text in enumerate(queries[1:], 1):
+                    permitted = {s.id for s in rows if (not game_code or s.game_code == game_code) and text in
+                        expand_chart_query(query, [(s.chart_variant, s.marker_aliases)])}
+                    results[index] = replace(results[index], candidates=tuple(c for c in results[index].candidates if c.game_song_id in permitted))
+                if await self.catalog.get_revision() == before:
+                    result = merge_alias_resolutions(results, game_code=game_code)
+                    if len(self._resolution_cache) >= 256:
+                        self._resolution_cache.pop(next(iter(self._resolution_cache)))
+                    self._resolution_cache[expanded_key] = result
+                    return result
+            else:
+                raise AliasConflictError("Catalog changed repeatedly during resolution")
         normalized = alias_key(str(query))
+        alias_normalized = _alias_search_key(str(query))
+        lookup_keys = _alias_lookup_keys([str(query)])
         key = (str(query), game_code, aliases_only, text_only)
         for _ in range(3):
             before = await self.catalog.get_revision()
@@ -350,19 +449,22 @@ class TortoiseAliasStore:
             candidates = []
             markers = parse_chart_title(str(query))[1]
             eligible = [s for s in rows if (not game_code or s.game_code == game_code) and (
-                not markers or tuple(s.chart_variant or ()) == markers
+                (not markers and (not s.chart_variant or normalized.isdecimal() or catalog_id)) or (markers and tuple(s.chart_variant or ()) == markers)
                 or (s.chart_variant == [] and titles[s.id] == normalized)
             )]
-            matching_works = set(await AliasEvidence.filter(alias_key=normalized).using_db(self.catalog._db).values_list("anchor__work_id", flat=True))
-            projection = await self.projection(_song_ids=[s.id for s in eligible if s.work_id in matching_works], _alias_keys=[normalized])
+            matching_works = set(await AliasEvidence.filter(alias_key__in=lookup_keys).using_db(self.catalog._db).values_list("anchor__work_id", flat=True))
+            projection = await self.projection(_song_ids=[s.id for s in eligible if s.work_id in matching_works], _alias_keys=lookup_keys)
             for song in eligible:
-                evidence = [e for e in projection.get(song.id, []) if e["alias_key"] == normalized and (not aliases_only or e["kind"] == "alias")]
+                evidence = [e for e in projection.get(song.id, []) if e["alias_key"] == (alias_normalized if e["kind"] == "alias" else normalized) and (not aliases_only or e["kind"] == "alias")]
                 title_hit = not aliases_only and titles[song.id] == normalized
                 # Host text queries use native IDs for the two LXNS games.
                 public_id = native_ids.get(song.id) if text_only and song.game_code in {"maimai", "chunithm"} else str(song.id)
                 id_query = str(int(normalized)) if text_only and normalized.isdecimal() else str(query)
                 ids = {public_id} if text_only else {public_id, native_ids.get(song.id)}
                 id_hit = not aliases_only and id_query in ids
+                if catalog_id and not aliases_only:
+                    evidence, title_hit = [], False
+                    id_hit = int(normalized[8:]) == song.id
                 if evidence or title_hit or id_hit:
                     games = tuple(sorted({e["origin_game"] for e in evidence if e["kind"] == "alias" and e["origin_game"]}))
                     candidates.append(AliasCandidate(song.id, str(song.work_id), song.game_code, song.title,
@@ -371,7 +473,7 @@ class TortoiseAliasStore:
                         scope="work" if any(e["scope"] == "work" for e in evidence) else "game_song",
                         chart_variant=tuple(song.chart_variant) if song.chart_variant is not None else None))
             exact = bool(candidates)
-            if not candidates and not aliases_only:
+            if not candidates and not aliases_only and not catalog_id:
                 search = self.catalog.text_search
                 permitted = {s.id for s in eligible}
                 songs_by_id = {s.id: s for s in eligible}
@@ -393,7 +495,7 @@ class TortoiseAliasStore:
                                                    _alias_keys={alias_key(match.matched_text) for _, match in matches})
                 for game, match in matches:
                     song = songs_by_id[match.song_id]
-                    evidence = [e for e in projection[song.id] if e["kind"] == "alias" and e["alias_key"] == alias_key(match.matched_text)]
+                    evidence = [e for e in projection[song.id] if e["kind"] == "alias" and e["alias_key"] == _alias_search_key(match.matched_text)]
                     games = tuple(sorted({e["origin_game"] for e in evidence if e["origin_game"]}))
                     candidates.append(AliasCandidate(song.id, str(song.work_id), game, song.title, match.matched_text,
                         match.match_type.value, match.match_score, games, tuple(e["id"] for e in evidence),
@@ -500,14 +602,18 @@ class TortoiseAliasStore:
         if operation in {"ADD_ALIAS", "REPLACE_ALIAS", "BLOCK_ALIAS", "UNBLOCK_ALIAS"}:
             alias_key(payload["text"])
             payload["text"] = normalize_width(payload["text"])
-            song = await GameSong.get(id=payload["game_song_id"]).only("id", "active", "game_code").using_db(db)
+            if operation in {"BLOCK_ALIAS", "UNBLOCK_ALIAS"}:
+                payload["text"] = _chart_alias(payload["text"], parse_chart_title(payload["text"])[1])
+            song = await GameSong.get(id=payload["game_song_id"]).only("id", "active", "game_code", "chart_variant").using_db(db)
             if not song.active:
                 raise ValueError("Choose an active song")
             if operation in {"ADD_ALIAS", "REPLACE_ALIAS"}:
+                if _chart_alias(payload["text"], song.chart_variant) is None:
+                    raise ValueError("Alias must fit the selected chart markers and 256-character limit")
                 payload.setdefault("origin_game", song.game_code)
                 if payload["origin_game"] not in {None, song.game_code}:
                     raise ValueError("Origin game must match the selected entry")
-                payload.setdefault("scope", "work")
+                payload.setdefault("scope", "game_song" if song.chart_variant else "work")
                 if payload["scope"] not in {"work", "game_song"}:
                     raise ValueError("Invalid scope")
         if operation == "RELINK_GAME_SONGS":
@@ -597,11 +703,16 @@ class TortoiseAliasStore:
         if not owner and not can_review:
             raise AliasPermissionError("Request is private")
         current, _ = await self._targets(db, row.operation, row.payload)
-        songs = await GameSong.filter(id__in=[int(k.split(":")[1]) for k in current if k.startswith("song:")]).only("id", "work_id").using_db(db)
+        songs = await GameSong.filter(id__in=[int(k.split(":")[1]) for k in current if k.startswith("song:")]).only("id", "work_id", "chart_variant").using_db(db)
         affected = await GameSong.filter(work_id__in=[s.work_id for s in songs], active=True).only("id", "game_code").using_db(db)
         collisions = []
         if "text" in row.payload:
-            collisions = [asdict(c) for c in (await self.resolve_alias(row.payload["text"])).candidates]
+            text = row.payload["text"]
+            if row.operation in {"ADD_ALIAS", "REPLACE_ALIAS"}:
+                target = next(s for s in songs if s.id == row.payload["game_song_id"])
+                text = _chart_alias(text, target.chart_variant)
+            if text is not None:
+                collisions = [asdict(c) for c in (await self.resolve_alias(text)).candidates]
         private = actor_id == row.actor_id or can_review
         visible_payload = dict(row.payload)
         if not private:
@@ -839,25 +950,57 @@ class TortoiseAliasStore:
 
     async def list_candidates(self, *, actor_id, after_id=0, limit=50):
         self.authorize(actor_id, "admin")
-        return await WorkCandidate.filter(status="pending", id__gt=after_id).using_db(self.catalog._db).order_by("id").limit(min(max(limit, 1), 100)).values()
+        rows = await WorkCandidate.filter(status="pending", id__gt=after_id).using_db(self.catalog._db).order_by("id").limit(min(max(limit, 1), 100)).values()
+        for row in rows:
+            row["song_ids"] = sorted({row["left_id"], row["right_id"], *map(int, row["target_versions"])})
+        return rows
 
-    async def decide_candidate(self, candidate_id, *, actor_id, accept, expected_version, reason):
+    async def decide_candidate(self, candidate_id, *, actor_id, accept, expected_version, reason, marker_aliases=None):
         self.authorize(actor_id, "admin")
         if not reason.strip():
             raise ValueError("A reason is required")
+        if marker_aliases is not None and not isinstance(marker_aliases, dict):
+            raise ValueError("Marker aliases must map song IDs to labels")
         async with self.write() as db:
             self.authorize(actor_id, "admin")
             candidate = await WorkCandidate.get(id=candidate_id).using_db(db)
             if candidate.status != "pending" or candidate.version != expected_version:
                 raise AliasConflictError("CANDIDATE_CHANGED")
-            songs = await GameSong.filter(id__in=[candidate.left_id, candidate.right_id]).using_db(db).order_by("id")
+            song_ids = {candidate.left_id, candidate.right_id, *map(int, candidate.target_versions)}
+            songs = await GameSong.filter(id__in=song_ids).using_db(db).order_by("id")
             if {str(s.id): s.version for s in songs} != candidate.target_versions:
                 raise AliasConflictError("TARGET_CHANGED")
+            if marker_aliases:
+                if not accept or not isinstance(marker_aliases, dict) or any(type(sid) is not int or sid not in song_ids for sid in marker_aliases):
+                    raise ValueError("Marker aliases require an accepted candidate and its song IDs")
+                for song in songs:
+                    labels = marker_aliases.get(song.id, [])
+                    if not isinstance(labels, list) or len(labels) > 16 or (labels and not song.chart_variant):
+                        raise ValueError("Choose up to 16 marker aliases for a special chart")
+                    for label in labels:
+                        if not isinstance(label, str):
+                            raise ValueError("Marker aliases must be text")
+                        label = normalize_width(label).strip()
+                        if label.startswith("[") and label.endswith("]"):
+                            label = label[1:-1].strip()
+                        if not 0 < len(label) <= 32 or any(c.isspace() or c in "[]" or ord(c) < 32 for c in label):
+                            raise ValueError("Marker aliases require 1-32 non-whitespace characters without brackets")
+                        source = await self._source(db, f"community:{song.game_code}", song.game_code, kind="community", known=True)
+                        await self._evidence(db, source, song.id, label, record_key=f"marker:{song.id}:{alias_key(label)}",
+                                             scope="game_song", kind="marker", actor_id=actor_id)
             if accept:
-                await merge_works(db, songs[1].work_id, songs[0].work_id, actor_id=actor_id, reason=reason)
+                target = songs[0].work_id
+                for work in sorted({s.work_id for s in songs} - {target}, key=str):
+                    await merge_works(db, work, target, actor_id=actor_id, reason=reason)
+                members = set(await GameSong.filter(work_id=target).using_db(db).values_list("id", flat=True))
+                for related in await WorkCandidate.filter(status="pending", left_id__in=members, right_id__in=members).exclude(id=candidate.id).using_db(db):
+                    if set(map(int, related.target_versions)) <= members:
+                        related.status, related.version = "accepted", related.version + 1
+                        await related.save(using_db=db)
             candidate.status, candidate.version = "accepted" if accept else "rejected", candidate.version + 1
             await candidate.save(using_db=db)
-            await self.event(db, "decide_candidate", actor_id=actor_id, after={"id": candidate.id, "status": candidate.status}, reason=reason)
+            await self.event(db, "decide_candidate", actor_id=actor_id, after={"id": candidate.id, "status": candidate.status,
+                             "marker_aliases": marker_aliases or {}}, reason=reason)
 
     async def associate(self, *, actor_id):
         self.authorize(actor_id, "admin")

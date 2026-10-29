@@ -552,7 +552,7 @@ async def test_shared_alias_inference_variants_and_reversible_association(catalo
     candidate = next(c for c in candidates if special in {c["left_id"], c["right_id"]})
     await service.decide_candidate(candidate["id"], actor_id=10, accept=True, expected_version=candidate["version"], reason="same audio confirmed")
     await approve(service, "ADD_ALIAS", {"game_song_id": special, "text": "Special Nick", "scope": "game_song"})
-    assert {c.game_song_id for c in (await service.resolve_alias("Special Nick")).candidates} == {special}
+    assert {c.game_song_id for c in (await service.resolve_alias("[新标记] Special Nick")).candidates} == {special}
     await assert_text_projection_matches_evidence(store)
     assert {c.game_song_id for c in (await service.search_all("[新标记] Shared Song")).candidates} == {special}
     await approve(service, "BLOCK_ALIAS", {"game_song_id": mai, "text": "Shared Nick"})
@@ -564,6 +564,272 @@ async def test_shared_alias_inference_variants_and_reversible_association(catalo
     await approve(service, "UNBLOCK_ALIAS", {"game_song_id": chuni, "text": "Shared Nick"})
     assert {c.game_song_id for c in (await service.resolve_alias("Shared Nick")).candidates} == {chuni}
     await assert_text_projection_matches_evidence(store)
+
+
+async def test_chart_family_is_one_review_with_legacy_pairs_and_stale_members(catalog):
+    from itertools import combinations
+    from arcade_helper.catalog.importer import content_key
+    from arcade_helper.storage.tortoise.alias_models import WorkCandidate
+
+    store, service = catalog
+    store.auto_match = False
+    titles = ["Family Song", *[f"[标记{i}] Family Song" for i in range(6)]]
+    ids = [await import_song(store, "maimai", title=title, native=str(i + 1)) for i, title in enumerate(titles)]
+    versions = dict(await GameSong.filter(id__in=ids).values_list("id", "version"))
+    for a, b in combinations(ids, 2):
+        await WorkCandidate.create(pair_key=content_key([a, b]), left_id=a, right_id=b, reason="variant_or_uncertain",
+            target_versions={str(a): versions[a], str(b): versions[b]})
+
+    await service.associate(actor_id=10)
+    candidates = await service.list_candidates(actor_id=10)
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert set(candidate["song_ids"]) == set(ids)
+    await GameSong.filter(id=ids[-1]).update(version=versions[ids[-1]] + 1)
+    with pytest.raises(AliasConflictError, match="TARGET_CHANGED"):
+        await service.decide_candidate(candidate["id"], actor_id=10, accept=True,
+            expected_version=candidate["version"], reason="old group must not be merged")
+    await service.associate(actor_id=10)
+    candidate, = await service.list_candidates(actor_id=10)
+    await service.decide_candidate(candidate["id"], actor_id=10, accept=True,
+        expected_version=candidate["version"], reason="same recording confirmed for all entries")
+    assert len(set(await GameSong.filter(id__in=ids).values_list("work_id", flat=True))) == 1
+    assert not await service.list_candidates(actor_id=10)
+    assert set(await GameSong.all().values_list("id", flat=True)) == set(ids)
+    await service.associate(actor_id=10)
+    assert not await service.list_candidates(actor_id=10)
+
+    rejected = [await import_song(store, "sdvx", title=title.replace("Family", "Rejected"), native=str(i + 1))
+                for i, title in enumerate(titles[:3])]
+    await service.associate(actor_id=10)
+    candidate = next(c for c in await service.list_candidates(actor_id=10) if set(c["song_ids"]) == set(rejected))
+    await service.decide_candidate(candidate["id"], actor_id=10, accept=False,
+        expected_version=candidate["version"], reason="music versions have not been confirmed")
+    await service.associate(actor_id=10)
+    assert not any(set(c["song_ids"]) <= set(rejected) for c in await service.list_candidates(actor_id=10))
+
+
+async def test_chart_alias_namespaces_cover_existing_evidence_and_every_search_path(catalog):
+    store, service = catalog
+    normal = await import_song(store, "maimai", title="Family Song", aliases=["Shared Nick"])
+    special = await import_song(store, "maimai", title="[奏] Family Song", native="2")
+    other = await import_song(store, "maimai", title="[未知][双人] Family Song", native="3")
+    cross_game = await import_song(store, "chunithm", title="Family Song")
+    await approve(service, "RELINK_GAME_SONGS", {"song_ids": [normal, special, other], "mode": "merge"})
+    # Existing raw evidence must become safe without requiring a fresh upstream sync.
+    await approve(service, "ADD_ALIAS", {"game_song_id": special, "text": "Source Nick", "scope": "game_song"})
+    await approve(service, "ADD_ALIAS", {"game_song_id": other, "text": "[未知][双人] Already Marked", "scope": "game_song"})
+    assert {c.game_song_id for c in (await service.resolve_alias("Shared Nick")).candidates} == {normal, cross_game}
+    for text, song_id in [("[奏]Shared Nick", special), ("[未知][双人] Shared Nick", other),
+                          ("[奏] Source Nick", special), ("[未知][双人] Already Marked", other)]:
+        result = await service.resolve_alias(text)
+        assert {c.game_song_id for c in result.candidates} == {song_id}
+        assert result.candidates[0].source_games == ("maimai",)
+    assert not (await service.resolve_alias("Source Nick")).candidates
+    assert await AliasEvidence.filter(anchor_id=special, raw_text="Source Nick").exists()
+    imported = SongData(id=2, title="[奏] Family Song", artist="Artist", alias_observations=[
+        AliasObservation(source_key="lxns:maimai", text="Imported Nick")])
+    await store.import_records("maimai", [CatalogRecord(imported, imported.model_dump(mode="json"), "2")],
+        provider="catalog", namespace="native", complete=False)
+    assert not (await service.resolve_alias("Imported Nick")).candidates
+    imported_hit, = (await service.resolve_alias("[奏] Imported Nick")).candidates
+    assert imported_hit.game_song_id == special and imported_hit.scope == "game_song"
+    assert imported_hit.source_games == ("maimai",)
+    assert await AliasEvidence.filter(anchor_id=special, raw_text="Imported Nick").exists()
+    aliases = await service.get_effective_aliases(other)
+    assert "[未知][双人] Already Marked" in {e["text"] for e in aliases}
+    assert "[未知][双人] [未知][双人] Already Marked" not in {e["text"] for e in aliases}
+    assert {c.game_song_id for c in (await service.search_all("shared nic", text_only=True)).candidates} == {normal, cross_game}
+    assert {c.game_song_id for c in (await service.search_all("[奏] shared nic", text_only=True)).candidates} == {special}
+    assert {r.song_id for r in await store.text_search.search_song("Shared Nick", game_code="maimai")} == {normal}
+    assert {r.song_id for r in await store.text_search.search_song("[奏] Shared Nick", game_code="maimai")} == {special}
+    assert (await store.text_search.search_song(special, game_code="maimai"))[0].song_id == special
+    await approve(service, "BLOCK_ALIAS", {"game_song_id": special, "text": "[奏]Shared Nick"})
+    assert not (await service.resolve_alias("[奏] Shared Nick")).candidates
+    assert {c.game_song_id for c in (await service.resolve_alias("Shared Nick")).candidates} == {normal, cross_game}
+    request = await approve(service, "ADD_ALIAS", {"game_song_id": special, "text": "Community Nick"})
+    assert (await AliasRequest.get(id=request)).payload["scope"] == "game_song"
+    assert {c.game_song_id for c in (await service.resolve_alias("[奏] Community Nick")).candidates} == {special}
+    for text in ("[其他] Wrong chart", "x" * 256):
+        with pytest.raises(ValueError, match="chart markers"):
+            await service.submit(actor_id=1, operation="ADD_ALIAS", payload={"game_song_id": special, "text": text},
+                                 idempotency_key=uuid4().hex)
+    await approve(service, "ADD_ALIAS", {"game_song_id": normal, "text": "x" * 256})
+    assert not any(e["text"].endswith("x" * 256) for e in await service.get_effective_aliases(special))
+    await assert_text_projection_matches_evidence(store)
+
+
+async def test_reviewed_marker_aliases_expand_without_changing_source_identity(catalog):
+    from arcade_helper.storage.tortoise.catalog_models import SongReference
+
+    store, service = catalog
+    store.auto_match = False
+    normal = await import_song(store, "maimai", aliases=["Bus", "Shared Nickname"])
+    special = await import_song(store, "maimai", title="[奏] Shared Song", native="2")
+    other = await import_song(store, "maimai", title="[未知][双人] Shared Song", native="3")
+    source = await SongReference.get(game_song_id=special)
+    original_identity = source.identity_material
+    assert not (await service.resolve_alias("宴Bus")).candidates
+    await service.associate(actor_id=10)
+    candidate, = await service.list_candidates(actor_id=10)
+    with pytest.raises(ValueError, match="special chart"):
+        await service.decide_candidate(candidate["id"], actor_id=10, accept=True,
+            expected_version=candidate["version"], reason="bad target", marker_aliases={normal: ["宴"]})
+    assert not await AliasEvidence.filter(kind="marker").exists()
+    assert len(set(await GameSong.all().values_list("work_id", flat=True))) == 3
+    await service.decide_candidate(candidate["id"], actor_id=10, accept=True,
+        expected_version=candidate["version"], reason="confirmed chart shortcuts",
+        marker_aliases={special: ["宴", "[派对]"], other: ["宴"]})
+    assert await service.get_marker_aliases([special, other]) == {special: ["宴", "派对"], other: ["宴"]}
+    for query, expected in [("Bus", {normal}), ("奏Bus", {special}), ("奏 Bus", {special}),
+                            ("未知双人Bus", {other}), ("未知 双人 Bus", {other}),
+                            ("宴Bus", {special, other}), ("宴 Bus", {special, other}),
+                            ("[宴] Bus", {special, other}), ("派对Bus", {special})]:
+        result = await service.resolve_alias(query)
+        assert {c.game_song_id for c in result.candidates} == expected, query
+        assert all(c.source_games == ("maimai",) for c in result.candidates)
+        assert {r.song_id for r in await store.text_search.search_song(query, game_code="maimai")} == expected, query
+    assert {c.game_song_id for c in (await service.search_all("宴 shared nicknam", text_only=True)).candidates} == {special, other}
+    assert not any(e["text"] in {"宴", "派对"} for e in await service.get_effective_aliases(special))
+    collision = await import_song(store, "sdvx", title="奏Bus")
+    assert {c.game_song_id for c in (await service.search_all("奏Bus")).candidates} == {special, collision}
+    await import_song(store, "maimai", title="[奏] Shared Song", native="2")
+    assert (await SongReference.get(id=source.id)).identity_material == original_identity
+    assert (await GameSong.get(id=special)).chart_variant == ["奏"]
+    assert {c.game_song_id for c in (await service.resolve_alias("派对Bus")).candidates} == {special}
+    same_marker = await import_song(store, "maimai", title="[奏] Shared Song", native="4")
+    await approve(service, "RELINK_GAME_SONGS", {"song_ids": [normal, same_marker], "mode": "merge"})
+    assert {c.game_song_id for c in (await service.resolve_alias("奏Bus")).candidates} == {special, same_marker}
+    assert {c.game_song_id for c in (await service.resolve_alias("宴Bus")).candidates} == {special, other}
+    assert {r.song_id for r in await store.text_search.search_song("派对Bus", game_code="maimai")} == {special}
+    await approve(service, "BLOCK_ALIAS", {"game_song_id": special, "text": "[奏] Bus"})
+    assert not (await service.resolve_alias("派对Bus")).candidates
+    assert {c.game_song_id for c in (await service.resolve_alias("宴Bus")).candidates} == {other}
+    await assert_text_projection_matches_evidence(store)
+
+
+async def test_native_sync_keeps_arcade_only_songs_and_later_native_identity(catalog, tmp_path):
+    from arcade_helper import ArcadeHelperClient
+    from arcade_helper.games.chunithm.data_fetcher import ARCADE_SITES_JSON_URL
+    from arcade_helper.storage.tortoise.catalog_models import SongReference
+
+    store, aliases = catalog
+    known = {"songId": "Known", "title": "Known", "artist": "Artist", "sheets": []}
+    new = {"songId": "Melodiniq", "title": "Melodiniq", "artist": "onoken a.k.a. owl＊tree", "version": "X-VERSE-X",
+           "sheets": [{"type": "std", "difficulty": "master", "level": "15+", "regions": {"jp": True, "intl": True}}]}
+    arcade = {"songs": [known, new]}
+    native = {"songs": [{"id": 7, "title": "Known", "artist": "Artist", "difficulties": []}]}
+    calls = []
+    async def get_json(url, **kwargs):
+        calls.append((url, kwargs))
+        assert kwargs.get("force_refresh") is True
+        if url == ARCADE_SITES_JSON_URL:
+            return [{"gameCode": "chunithm", "dataSourceUrl": "https://source.test/chunithm"}]
+        if url == "https://source.test/chunithm/data.json":
+            return arcade
+        if "/song/list" in url:
+            return native
+        if "/alias/list" in url:
+            return {"aliases": []}
+        raise AssertionError(url)
+    client = ArcadeHelperClient(http_get_json=get_json, catalog_store=store, local_data_dir=tmp_path)
+    await client.lifecycle.start()
+    try:
+        assert (await client.catalog.sync_game_from_remote("chunithm", include_songs=False)).ok
+        result = await aliases.search_all("Melodiniq", game_code="chunithm", text_only=True)
+        candidate, = result.candidates
+        sid = candidate.game_song_id
+        assert await GameSong.filter(game_code="chunithm").count() == 2
+        assert not await SongReference.filter(game_song_id=sid, provider="catalog", namespace="native").exists()
+        song = (await store.get_songs_by_ids("chunithm", [sid]))[sid]
+        assert song.difficulties["standard"][0].regions == {"jp": True, "intl": True}
+        hydrated, = await client.catalog.search_song("chunithm", "Melodiniq")
+        assert hydrated.song_data.catalog_only and hydrated.song_id == sid
+        assert (await client.catalog.search_song("chunithm", f"catalog:{sid}"))[0].song_id == sid
+        await approve(aliases, "ADD_ALIAS", {"game_song_id": sid, "text": "Stable New Nick"})
+        arcade["songs"].reverse()
+        assert (await client.catalog.sync_game_from_remote("chunithm", include_songs=False)).ok
+        assert (await aliases.resolve_alias("Stable New Nick")).candidates[0].game_song_id == sid
+        native["songs"].append({"id": 77, "title": "Melodiniq", "artist": "onoken a.k.a. owl*tree", "difficulties": []})
+        assert (await client.catalog.sync_game_from_remote("chunithm", include_songs=False)).ok
+        assert (await SongReference.get(provider="catalog", namespace="native", game_code="chunithm", external_key="77")).game_song_id == sid
+        assert await GameSong.filter(game_code="chunithm").count() == 2
+        assert (await aliases.resolve_alias("Stable New Nick")).candidates[0].game_song_id == sid
+        hydrated, = await client.catalog.search_song("chunithm", "Melodiniq")
+        assert hydrated.song_id == 77 and not getattr(hydrated.song_data, "catalog_only", False)
+        assert sum(url == "https://source.test/chunithm/data.json" for url, _ in calls) == 3
+    finally:
+        await client.lifecycle.stop()
+
+
+async def test_maimai_sync_unions_sources_without_fake_native_ids_or_reviving_aliases(catalog, tmp_path):
+    from arcade_helper import ArcadeHelperClient
+    from arcade_helper.games.maimai.schemas import MaiSongData
+    from arcade_helper.storage.tortoise.catalog_models import SongReference
+    from arcade_helper.storage.tortoise.models import MaiSong
+
+    store, aliases = catalog
+    dx = {"songs": [
+        {"songId": "known", "title": "Known DX", "artist": "Artist", "sheets": [{"type": "std", "difficulty": "master", "level": "14", "internalId": 42}]},
+        {"songId": "fresh", "title": "Fresh DX", "artist": "Composer", "imageName": "fresh.png", "sheets": []},
+    ]}
+    lxns = {"songs": [
+        {"id": 42, "title": "Known DX", "artist": "Artist", "difficulties": {}},
+        {"id": 43, "title": "LXNS Exclusive", "artist": "Other", "difficulties": {"dx": [{"difficulty": 3, "level": "13+", "level_value": 13.7}]}},
+    ]}
+    async def get_json(url, **kwargs):
+        assert kwargs.get("force_refresh") is True
+        if "original.json" in url:
+            return dx
+        if "/api/v1/aliases" in url:
+            return [{"song_id": "known", "name": "Old DX Nick"}, {"song_id": "fresh", "name": "Fresh DX Nick"}]
+        if "/song/list" in url:
+            return lxns
+        if "/alias/list" in url:
+            return {"aliases": []}
+        if "yuzu" in url:
+            return {"content": []}
+        return {"data": 1}
+    client = ArcadeHelperClient(http_get_json=get_json, catalog_store=store, local_data_dir=tmp_path)
+    await client.lifecycle.start()
+    try:
+        # Existing accepted/revoked DX records must retain their evidence identity during upgrade.
+        await client.catalog.sync_songs("maimai", {42: MaiSongData(id=42, title="Known DX", artist="Artist",
+            alias_observations=[AliasObservation(source_key="dxrating:maimai", text="Old DX Nick")])})
+        old = await AliasEvidence.get(source__source_key="dxrating:maimai", raw_text="Old DX Nick")
+        await AliasEvidence.filter(id=old.id).update(moderation_state="revoked")
+        assert (await client.catalog.sync_game_from_remote("maimai", include_songs=False)).ok
+        assert await GameSong.filter(game_code="maimai").count() == 3
+        assert set(await MaiSong.all().values_list("id", flat=True)) == {42, 43}
+        result, = await client.catalog.search_song("maimai", "Fresh DX Nick")
+        sid = result.song_id
+        assert result.song_data.catalog_only and result.song_data.image_name.startswith("https://")
+        assert not await SongReference.filter(game_song_id=sid, provider="catalog", namespace="native").exists()
+        exclusive, = await client.catalog.search_song("maimai", "LXNS Exclusive")
+        assert exclusive.song_id == 43 and exclusive.song_data.difficulties["dx"][0].regions == {"cn": True}
+        assert exclusive.song_data.difficulties["dx"][0].difficulty == "master"
+        assert not (await aliases.resolve_alias("Old DX Nick")).candidates
+        assert (await AliasEvidence.get(id=old.id)).moderation_state == "revoked"
+        from arcade_helper.storage.tortoise.catalog_store import CatalogConflictError
+        revision = await store.get_revision()
+        with pytest.raises(CatalogConflictError):
+            await client.catalog.sync_songs("maimai", {99: MaiSongData(id=99, title="Must roll back", artist="Other")},
+                supplemental_provider="dxrating", supplemental_payload=dx, expected_supplemental_version=0)
+        assert await store.get_revision() == revision
+        assert not await MaiSong.filter(id=99).exists()
+        assert not await GameSong.filter(title="Must roll back").exists()
+        evidence = await AliasEvidence.get(raw_text="Fresh DX Nick")
+        await AliasEvidence.filter(id=evidence.id).update(moderation_state="revoked")
+        dx["songs"].reverse()
+        lxns["songs"].append({"id": 44, "title": "Fresh DX", "artist": "Composer", "difficulties": {}})
+        assert (await client.catalog.sync_game_from_remote("maimai", include_songs=False)).ok
+        assert (await SongReference.get(game_code="maimai", provider="catalog", namespace="native", external_key="44")).game_song_id == sid
+        assert (await AliasEvidence.get(id=evidence.id)).moderation_state == "revoked"
+        assert await AliasEvidence.filter(raw_text="Fresh DX Nick").count() == 1
+        assert not (await aliases.resolve_alias("Fresh DX Nick")).candidates
+        assert await GameSong.filter(game_code="maimai").count() == 3
+    finally:
+        await client.lifecycle.stop()
 
 
 async def test_cross_game_search_rejects_artist_only_hit_in_unrelated_query(catalog):

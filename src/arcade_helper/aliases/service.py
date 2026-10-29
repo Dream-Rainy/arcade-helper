@@ -15,7 +15,7 @@ class AliasService:
     def __getattr__(self, name):
         if name not in {"configure_source", "source_versions", "sync_source", "get_effective_aliases", "search_all",
                         "resolve_alias", "submit", "get_request", "list_requests", "withdraw", "supersede", "review",
-                        "list_candidates", "decide_candidate", "associate", "events"}:
+                        "list_candidates", "decide_candidate", "associate", "events", "get_marker_aliases", "expand_query"}:
             raise AttributeError(name)
         if self.catalog_store is None or not self.catalog_store.enable_aliases:
             raise StorageNotConfiguredError("Enable aliases on a persistent catalog store first")

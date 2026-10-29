@@ -1,7 +1,7 @@
 """Public alias values and conservative text normalization."""
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
@@ -68,6 +68,29 @@ class AliasResolution:
     inference_reason: str
     candidates: tuple[AliasCandidate, ...]
     unavailable_games: tuple[str, ...] = ()
+
+
+def merge_alias_resolutions(results, *, game_code=None):
+    candidates = {}
+    for result in results:
+        for candidate in result.candidates:
+            key = (candidate.game_code, candidate.game_song_id)
+            rank = (candidate.match_type.startswith("exact_"), candidate.score)
+            old = candidates.get(key)
+            if old is None or rank > (old.match_type.startswith("exact_"), old.score):
+                candidates[key] = candidate
+    exact = any(c.match_type.startswith("exact_") for c in candidates.values())
+    rows = [c for c in candidates.values() if not exact or c.match_type.startswith("exact_")]
+    preferences = {}
+    for work in {c.work_id for c in rows}:
+        choices = {c.preferred_game for c in rows if c.work_id == work}
+        preferences[work] = next(iter(choices)) if len(choices) == 1 else None
+    rows = [replace(c, preferred_game=preferences[c.work_id]) for c in rows]
+    rows.sort(key=lambda c: (c.game_code != c.preferred_game, -c.score, c.game_code, c.game_song_id))
+    inferred = next(iter(preferences.values())) if exact and len(preferences) == 1 else None
+    return AliasResolution("explicit" if game_code else "inferred" if inferred else "ambiguous" if rows else "unknown",
+        game_code or inferred, "explicit_game" if game_code else "alias_origin_or_only_game" if inferred else "candidates_require_choice",
+        tuple(rows), tuple(sorted({game for result in results for game in result.unavailable_games})))
 
 
 def has_music_variant(title: str, payload: dict) -> bool:

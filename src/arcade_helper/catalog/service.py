@@ -12,11 +12,12 @@ from typing import Any, Literal
 
 from arcade_helper.core.errors import CatalogSyncError, StorageNotConfiguredError
 from arcade_helper.core.song import SongData
-from arcade_helper.catalog.importer import CatalogImportReport, CatalogRecord, prepare_native_catalog
+from arcade_helper.catalog.importer import CatalogImportReport, CatalogRecord, prepare_native_catalog, prepare_arcade_catalog
 from arcade_helper.core.song_identity import normalize_width
 from arcade_helper.aliases import AliasService
+from arcade_helper.aliases.models import alias_key
 from arcade_helper.games.arcade_songs import ARCADE_SONGS_CACHE_TTL_SECONDS
-from arcade_helper.search import SongQueryResult, SongSearchService
+from arcade_helper.search import MatchType, SongQueryResult, SongSearchService
 from arcade_helper.search.song_query import invalidate_alias_cache
 
 
@@ -31,6 +32,8 @@ class CatalogFetchResult:
     songs: dict[int, Any]
     provider: str
     data_version: int | None = None
+    supplemental_payload: dict[str, Any] | None = None
+    supplemental_provider: str | None = None
 
 
 @dataclass(frozen=True)
@@ -244,6 +247,8 @@ class SongCatalogService:
                 songs=result.songs,
                 provider=route.provider.name,
                 data_version=result.data_version,
+                supplemental_payload=getattr(result, "dxrating_payload", None),
+                supplemental_provider="dxrating",
             )
 
         songs = await method()
@@ -251,6 +256,8 @@ class SongCatalogService:
             game_code=game_code,
             songs=songs,
             provider=route.provider.name,
+            supplemental_payload=getattr(songs, "arcade_payload", None),
+            supplemental_provider="arcade_songs" if game_code == "chunithm" else None,
         )
 
     async def fetch_arcade_songs_sites(self) -> list[dict[str, Any]]:
@@ -324,11 +331,16 @@ class SongCatalogService:
                     )
                 alias_versions = await self.aliases.source_versions(game_code) if self._aliases_enabled() else None
                 sync_version = await self.identities.get_sync_version(game_code, provider="catalog", namespace="native") if self._aliases_enabled() else None
+                supplement_provider = {"maimai": "dxrating", "chunithm": "arcade_songs"}.get(game_code)
+                supplement_version = (await self.identities.get_sync_version(game_code, provider=supplement_provider)
+                                      if self._aliases_enabled() and supplement_provider else None)
                 fetched = await self.fetch_game_raw_data(
                     game_code,
                     current_data_version=current_data_version,
                 )
-                await self.sync_songs(game_code, fetched.songs, expected_sync_version=sync_version, expected_alias_versions=alias_versions)
+                await self.sync_songs(game_code, fetched.songs, expected_sync_version=sync_version, expected_alias_versions=alias_versions,
+                    supplemental_payload=getattr(fetched, "supplemental_payload", None), supplemental_provider=getattr(fetched, "supplemental_provider", None),
+                    expected_supplemental_version=supplement_version)
                 return CatalogSyncResult(
                     game_code=game_code,
                     provider=fetched.provider,
@@ -369,7 +381,8 @@ class SongCatalogService:
         """Persist maimai collection data for one song."""
         await self._require_song_store().sync_maimai_collections(song_id, collections)
 
-    async def sync_songs(self, game_code: str, song_data: dict[int, Any], *, expected_sync_version=None, expected_alias_versions=None) -> None:
+    async def sync_songs(self, game_code: str, song_data: dict[int, Any], *, expected_sync_version=None, expected_alias_versions=None,
+                         supplemental_payload=None, supplemental_provider=None, expected_supplemental_version=None) -> None:
         """Persist a game song catalog directly."""
         store = self._require_song_store()
         from arcade_helper.storage.tortoise.song_store import TortoiseSongStore
@@ -377,16 +390,56 @@ class SongCatalogService:
             from tortoise.transactions import in_transaction
 
             records, invalid = prepare_native_catalog(game_code, song_data)
+            extra, bad = prepare_arcade_catalog(supplemental_payload) if supplemental_payload is not None else ([], [])
+            if game_code == "maimai" and supplemental_payload is not None:
+                # Import the complete DX alias source once, including songs without native IDs.
+                by_source = {song.songId: song for song in song_data.values() if getattr(song, "songId", None)}
+                enriched = []
+                for record in extra:
+                    source = by_source.get(record.source_record_key)
+                    if source is not None:
+                        observations = []
+                        for observation in source.alias_observations:
+                            if observation.source_key != "dxrating:maimai":
+                                continue
+                            try:
+                                alias_key(observation.text)
+                            except ValueError as exc:
+                                bad.append(f"dxrating:{record.source_record_key}: {exc}")
+                                continue
+                            observations.append(observation)
+                        record = replace(record, song=record.song.model_copy(update={
+                            "image_name": source.image_name, "alias_observations": observations,
+                            "alias_complete_sources": [s for s in source.alias_complete_sources if s == "dxrating:maimai"],
+                        }))
+                    enriched.append(record)
+                extra = enriched
+                cleaned = []
+                for record in records:
+                    observations = [o for o in record.song.alias_observations if o.source_key != "dxrating:maimai"]
+                    cleaned.append(replace(record, song=record.song.model_copy(update={
+                        "alias_observations": observations, "aliases": [record.song.title, *(o.text for o in observations)],
+                        "alias_complete_sources": [s for s in record.song.alias_complete_sources if s != "dxrating:maimai"],
+                    })))
+                records = cleaned
             if not records:
                 raise CatalogSyncError(f"No usable {game_code} songs: " + "; ".join(invalid))
             usable = {int(record.native_key): record.song for record in records}
             async with in_transaction(self.identities.connection_name):
+                bindings = (await self.identities.reference_bindings(game_code, records,
+                    provider=supplemental_provider, exclude_native=True) if supplemental_payload is not None else {})
                 await self.identities.import_records(game_code, records, provider="catalog", namespace="native", complete=False,
-                    invalid=invalid, alias_complete=True, expected_sync_version=expected_sync_version, expected_alias_versions=expected_alias_versions)
+                    invalid=invalid, alias_complete=True, expected_sync_version=expected_sync_version,
+                    expected_alias_versions=expected_alias_versions, bindings=bindings)
                 if isinstance(store, TortoiseSongStore):
                     await store.sync_songs(game_code, usable, write_aliases=False)
                 else:
                     await store.sync_songs(game_code, usable)
+                if supplemental_payload is not None:
+                    bindings = await self.identities.reference_bindings(game_code, extra, provider="catalog", namespace="native")
+                    await self.identities.import_records(game_code, extra, provider=supplemental_provider,
+                        raw_payload=supplemental_payload, invalid=bad, bindings=bindings,
+                        expected_sync_version=expected_supplemental_version, expected_alias_versions=expected_alias_versions)
             if invalid and self.logger is not None:
                 self.logger.warning(f"[{game_code}] skipped {len(invalid)} invalid catalog values: " + "; ".join(invalid))
             self.invalidate_search_cache(game_code)
@@ -544,7 +597,45 @@ class SongCatalogService:
         query: str | int,
     ) -> list[SongQueryResult]:
         """Search songs by id, title, alias, or fuzzy text."""
+        if self._aliases_enabled():
+            resolution = await self.search_all(str(query), game_code=game_code, text_only=True)
+            return await self.hydrate_candidates(resolution.candidates)
         return await self.search.search_song(query, game_code=game_code)
+
+    async def hydrate_candidates(self, candidates) -> list[SongQueryResult]:
+        """Preserve native IDs; hydrate source-only entries by stable catalog identity."""
+        from arcade_helper.storage.tortoise.catalog_models import SongReference
+
+        candidates = tuple(candidates)
+        for _ in range(3):
+            before = await self.get_revision()
+            native = {(game, sid): int(key) for game, sid, key in await SongReference.filter(
+                provider="catalog", namespace="native", game_code__in=["maimai", "chunithm"], present=True,
+                game_song_id__in={c.game_song_id for c in candidates}).using_db(self.identities._db).values_list(
+                    "game_code", "game_song_id", "external_key") if key.isdecimal()}
+            loaded = {}
+            for game in {c.game_code for c in candidates}:
+                rows = [c for c in candidates if c.game_code == game]
+                if game not in {"maimai", "chunithm"}:
+                    songs = await self.identities.get_songs_by_ids(game, [c.game_song_id for c in rows])
+                    loaded.update(((game, sid), song) for sid, song in songs.items())
+                    continue
+                songs = await self.get_songs_by_ids(game, [native[(game, c.game_song_id)] for c in rows
+                                                          if (game, c.game_song_id) in native])
+                for c in rows:
+                    sid = native.get((game, c.game_song_id))
+                    if sid in songs:
+                        loaded[(game, c.game_song_id)] = songs[sid]
+                extra = await self.identities.get_songs_by_ids(game, [c.game_song_id for c in rows
+                                                                      if (game, c.game_song_id) not in native])
+                for sid, song in extra.items():
+                    song.catalog_only = True
+                    loaded[(game, sid)] = song
+            if await self.get_revision() == before:
+                return [SongQueryResult(native.get((c.game_code, c.game_song_id), c.game_song_id), c.title,
+                    MatchType(c.match_type), c.score, c.matched_text, loaded[(c.game_code, c.game_song_id)])
+                    for c in candidates if (c.game_code, c.game_song_id) in loaded]
+        raise CatalogSyncError("Catalog changed repeatedly during candidate hydration")
 
     async def query_song_by_id(self, game_code: str, song_id: int) -> SongQueryResult | None:
         """Search the catalog by exact song id."""

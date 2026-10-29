@@ -21,6 +21,11 @@ ARCADE_SITES_JSON_URL = (
 
 _CHUNI_REMOTE_ASSETS_BASE_URL = "https://assets2.lxns.net/chunithm"
 
+
+class _ChunithmCatalog(dict[int, ChuniSongData]):
+    """Keep native callers compatible while passing the fetched source to storage."""
+    arcade_payload: dict
+
 _CHUNI_LXNS_LEVEL_TO_LABEL: dict[int, str] = {
     0: "basic",
     1: "advanced",
@@ -484,7 +489,9 @@ async def fetch_chunithm_catalog(context: CatalogContext) -> dict[int, ChuniSong
         if isinstance(alias_data.get("aliases"), list):
             song.alias_complete_sources = ["lxns:chunithm"]
 
-    return merged
+    result = _ChunithmCatalog(merged)
+    result.arcade_payload = arcade_chuni
+    return result
 
 
 __all__ = [
