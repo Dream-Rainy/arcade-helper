@@ -69,9 +69,9 @@ def create_app(*, token, public_url, ttl=3600, max_channels=256):
 
     @app.get(BASE + "/{asset}")
     async def asset(asset: str):
-        if asset not in {"portal.css", "portal.js", "relay.js"}:
+        if asset not in {"portal.css", "portal.js", "relay.js", "alias-view.html"}:
             raise HTTPException(404)
-        return FileResponse(ASSET_DIR / asset, media_type="text/css" if asset.endswith("css") else "application/javascript")
+        return FileResponse(ASSET_DIR / asset, media_type="text/html" if asset.endswith("html") else "text/css" if asset.endswith("css") else "application/javascript")
 
     @app.post(BASE + "/api/channels", status_code=201)
     async def create(request: Request):

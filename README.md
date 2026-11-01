@@ -217,6 +217,8 @@ uv build --out-dir dist
 
 ## 独立别名网页与中继
 
+管理扩展可复用同一传输：`EditorSession.start(page_path="/manage/")`指定同源页面，通道地址和加密协议仍沿用原值，默认入口保持不变。宿主可在`create_app()`返回的ASGI应用上挂载自己的静态页面。`relay.js`同时提供`window.editorRelay`与兼容的`window.aliasRelay`；`mountAliasPortal(root, relay, onLogout)`可把原审批面板挂入其他页面，业务权限仍由机器人核验。`alias-view.html`及面板资源属于受信任的同源部署资源。
+
 `web` extra 提供独立网页、中继 CLI 和机器人出站编辑会话。安装 `pip install '.[web]'` 后可运行 `arcade-alias-relay`，或 `python -m arcade_helper.web.relay`。它不加载 NoneBot、数据库或机器人配置。
 
 本机验证（HTTP 仅限 localhost）：

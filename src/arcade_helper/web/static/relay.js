@@ -1,5 +1,5 @@
 "use strict";
-window.aliasRelay = new class {
+window.editorRelay = window.aliasRelay = new class {
   constructor(){
     this.pending=new Map();
     this.sent=this.received=0;
@@ -18,7 +18,7 @@ window.aliasRelay = new class {
     this.channel=params.get("channel");
     history.replaceState(null,"",location.pathname);
     const access=params.get("key"),server=params.get("public"),secret=params.get("secret");
-    if(!this.channel||!/^[A-Za-z0-9_-]{16,64}$/.test(this.channel)||!access||!server||!secret||!/^[A-Za-z0-9_-]{43}$/.test(secret))throw new Error("请私聊机器人发送 /arcade.editor，并打开机器人返回的新链接。");
+    if(!this.channel||!/^[A-Za-z0-9_-]{16,64}$/.test(this.channel)||!access||!server||!secret||!/^[A-Za-z0-9_-]{43}$/.test(secret))throw new Error("请私聊机器人获取并打开新的临时链接。");
     this.aad=new TextEncoder().encode(this.channel);
     const pair=await crypto.subtle.generateKey({name:"ECDH",namedCurve:"P-256"},false,["deriveBits"]);
     const peer=await crypto.subtle.importKey("raw",this.bytes(server),{name:"ECDH",namedCurve:"P-256"},false,[]);
@@ -29,7 +29,7 @@ window.aliasRelay = new class {
     const authKey=await crypto.subtle.importKey("raw",new TextEncoder().encode(secret),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
     const signature=new Uint8Array(await crypto.subtle.sign("HMAC",authKey,new TextEncoder().encode(`${this.channel}:${publicKey}`)));
     const proof=Array.from(signature,byte=>byte.toString(16).padStart(2,"0")).join("");
-    const url=new URL(`./api/channels/${this.channel}/browser`,location.href);
+    const url=new URL(`/arcade/aliases/api/channels/${this.channel}/browser`,location.href);
     url.protocol=url.protocol==="https:"?"wss:":"ws:";
     this.socket=new WebSocket(url);
     this.timer=setTimeout(()=>this.fail(new Error("连接超时，请重新私聊机器人获取编辑链接。")),15000);
@@ -85,7 +85,7 @@ window.aliasRelay = new class {
     this.pending.clear();
     this.key=null;
     if(this.socket&&this.socket.readyState<2)this.socket.close();
-    if(typeof signedOut==="function")signedOut();
-    const node=document.getElementById("notice");node.textContent=error.message;node.className="error";node.hidden=false;
+    window.dispatchEvent(new Event("editorclosed"));
+    const node=document.getElementById("notice");if(node){node.textContent=error.message;node.className="error";node.hidden=false;}
   }
 }();

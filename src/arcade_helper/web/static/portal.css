@@ -1,6 +1,7 @@
-:root{font-family:Inter,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;color:#182a3c;background:#f3f5f8;font-size:15px;--blue:#1748ae;--border:#dde3ec;--muted:#586879}
+@scope (.alias-panel) {
+:scope{font-family:Inter,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;color:#182a3c;background:#f3f5f8;font-size:15px;--blue:#1748ae;--border:#dde3ec;--muted:#586879}
 *{box-sizing:border-box}
-body{margin:0}
+:scope{margin:0}
 button,input,select,textarea{font:inherit}
 button{min-height:44px;border:1px solid transparent;border-radius:8px;padding:10px 17px;background:var(--blue);color:white;font-weight:600;cursor:pointer}
 button:hover:not(:disabled){filter:brightness(.94)}
@@ -82,8 +83,8 @@ pre{padding:14px;background:#f3f5f9;border-radius:7px;white-space:pre-wrap;overf
 .compact{max-height:270px;margin:12px 0}
 .selection-chip{display:flex;align-items:center;justify-content:space-between;gap:10px;border-bottom:1px solid var(--border);padding:9px 0;overflow-wrap:anywhere}
 #mapping-detail{margin-top:20px}
-#notice{position:sticky;top:10px;z-index:5;background:#eaf3fd;color:#174778;border:1px solid #afc9eb;padding:13px 17px;border-radius:9px;margin-bottom:20px;overflow-wrap:anywhere}
-#notice.error{background:#fff0f1;border-color:#edc1c6;color:#932b3e}
+#alias-notice{position:sticky;top:10px;z-index:5;background:#eaf3fd;color:#174778;border:1px solid #afc9eb;padding:13px 17px;border-radius:9px;margin-bottom:20px;overflow-wrap:anywhere}
+#alias-notice.error{background:#fff0f1;border-color:#edc1c6;color:#932b3e}
 .login-card{max-width:580px;margin:38px auto;background:white;border:1px solid var(--border);border-radius:16px;padding:38px;box-shadow:0 12px 45px #2340690c}
 .login-card h1{font-size:28px}
 .steps{padding:0;list-style:none;counter-reset:steps;margin:28px 0}
@@ -131,3 +132,5 @@ h1{font-size:25px}
 
 .song-meta{overflow-wrap:anywhere}
 
+
+}

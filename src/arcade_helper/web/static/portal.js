@@ -1,5 +1,13 @@
 "use strict";
-const $ = id => document.getElementById(id);
+window.mountAliasPortal = async function(root, relay, onLogout=async()=>{await relay.request("logout",{});relay.socket.close();}) {
+  if(root.dataset.mounted) return;
+  const view=await fetch("/arcade/aliases/alias-view.html");
+  if(!view.ok)throw new Error("别名面板加载失败");
+  root.innerHTML=await view.text();
+  root.dataset.mounted="true";
+"use strict";
+const $ = id => root.querySelector("#"+({identity:"alias-identity",notice:"alias-notice",logout:"alias-logout"}[id]||id));
+window.addEventListener("editorclosed",()=>{signedOut();notice("会话已结束，请重新获取链接。",true);},{once:true});
 let authVersion = 0;
 const state = {me:null, song:null, selectedSongId:null, cursors:{}, lists:{}, relink:new Map(), mapping:null};
 const ops = {ADD_ALIAS:"新增别名",RETRACT_EVIDENCE:"撤回来源证据",REPLACE_ALIAS:"替换别名",BLOCK_ALIAS:"屏蔽别名",UNBLOCK_ALIAS:"恢复别名",RELINK_GAME_SONGS:"调整作品关系",MAP_SOURCE_RECORD:"来源记录映射"};
@@ -15,7 +23,7 @@ async function api(path,body){
   const version=authVersion;
   let response,data;
   try{
-    response=await window.aliasRelay.request(path,body);
+    response=await relay.request(path,body);
     data=await response.json();
   }catch(error){
     if(version!==authVersion)error.obsolete=true;
@@ -51,8 +59,8 @@ function signedOut(){
   state.cursors={};
   state.lists={};
   for(const id of ["song-results","selected-info","linked-entries","evidence-list","my-list","review-list","review-detail","candidate-list","import-list","pending-list","mapping-detail","relink-results","relink-selection","detail-content"])clear($(id));
-  for(const form of document.querySelectorAll("form"))form.reset();
-  for(const dialog of document.querySelectorAll("dialog"))dialog.close();
+  for(const form of root.querySelectorAll("form"))form.reset();
+  for(const dialog of root.querySelectorAll("dialog"))dialog.close();
   $("identity").textContent="";
   $("song-selected").hidden=true;
   $("selection-empty").hidden=false;
@@ -60,13 +68,13 @@ function signedOut(){
   $("workspace").hidden=true;
   $("account").hidden=true;
   $("login").hidden=false;
-  document.querySelectorAll(".admin-only").forEach(node=>node.hidden=true);
+  root.querySelectorAll(".admin-only").forEach(node=>node.hidden=true);
 }
 
-async function signedIn(me){authVersion++;state.me=me;$("login").hidden=true;$("workspace").hidden=false;$("account").hidden=false;$("identity").textContent=me.label+(me.admin?" · 管理员":"");document.querySelectorAll(".admin-only").forEach(n=>n.hidden=!me.admin);const games=await api("games");for(const id of ["game-filter","relink-game"]){const select=$(id);select.replaceChildren(new Option("全部游戏",""),...games.map(g=>new Option(g,g)));}switchView("submit");await loadRequests("my");}
-function switchView(view){for(const section of ["submit","review","match"]){$("view-"+section).hidden=section!==view;document.querySelector(`[data-view="${section}"]`)?.setAttribute("aria-current",section===view?"page":"false");}}
-bind($("logout"),"click",async()=>{await api("logout",{});signedOut();window.aliasRelay.socket.close();notice("已退出登录。请私聊机器人重新获取编辑链接。");});
-for(const tab of document.querySelectorAll("[data-view]"))bind(tab,"click",async()=>{const view=tab.dataset.view;switchView(view);if(view==="review")await loadRequests("review");if(view==="match")await Promise.all([loadCandidates(),loadImports()]);});
+async function signedIn(me){authVersion++;state.me=me;$("login").hidden=true;$("account").hidden=false;$("identity").textContent=me.label+(me.admin?" · 管理员":"");root.querySelectorAll(".admin-only").forEach(n=>n.hidden=!me.admin);const games=await api("games");for(const id of ["game-filter","relink-game"]){const select=$(id);select.replaceChildren(new Option("全部游戏",""),...games.map(g=>new Option(g,g)));}switchView("submit");await loadRequests("my");$("workspace").hidden=false;}
+function switchView(view){for(const section of ["submit","review","match"]){$("view-"+section).hidden=section!==view;root.querySelector(`[data-view="${section}"]`)?.setAttribute("aria-current",section===view?"page":"false");}}
+bind($("logout"),"click",async()=>{await onLogout();signedOut();notice("已退出登录。请私聊机器人重新获取编辑链接。");});
+for(const tab of root.querySelectorAll("[data-view]"))bind(tab,"click",async()=>{const view=tab.dataset.view;switchView(view);if(view==="review")await loadRequests("review");if(view==="match")await Promise.all([loadCandidates(),loadImports()]);});
 function songCard(song){const box=el("div",undefined,"song-meta");const tags=el("div",undefined,"tags");tags.append(badge(song.game_code||"未知游戏"),badge("ID "+(song.public_id??song.id??song.game_song_id)));if(song.active===false)tags.append(badge("已下架","withdrawn"));box.append(tags,el("h3",song.title||"未知乐曲"),el("div",song.artist||"作者未提供","muted"));const markers=Array.isArray(song.chart_variant)?song.chart_variant.join(" · "):song.chart_variant;if(markers)box.append(el("p","谱面标记："+markers,"hint"));if(song.marker_aliases?.length)box.append(el("p","搜索标记："+song.marker_aliases.join("、"),"hint"));return box;}
 function resultButton(song,onPick){const b=button("",()=>onPick(song),"result");b.append(badge(song.game_code),el("strong",song.title),el("span",[song.artist||"作者未提供","ID "+song.public_id,song.matched_text&&song.matched_text!==song.title?"命中 "+song.matched_text:""].filter(Boolean).join(" · "),"muted"));return b;}
 let searchVersion=0;
@@ -90,7 +98,7 @@ async function showRequest(id,container){container.className="";container.replac
 }
 bind($("detail-close"),"click",()=>$("detail-dialog").close());
 let actionCallback=null,actionNeedsReason=true;
-function openAction(title,description,fields,fn,needsReason=true){$("action-title").textContent=title;$("action-description").textContent=description;$("action-fields").replaceChildren(...(fields?[fields]:[]));$("action-reason").value="";$("action-reason").required=needsReason;$("action-reason").hidden=!needsReason;document.querySelector('label[for="action-reason"]').hidden=!needsReason;$("action-error").textContent="";actionCallback=fn;actionNeedsReason=needsReason;$("action-submit").disabled=false;$("action-dialog").showModal();}
+function openAction(title,description,fields,fn,needsReason=true){$("action-title").textContent=title;$("action-description").textContent=description;$("action-fields").replaceChildren(...(fields?[fields]:[]));$("action-reason").value="";$("action-reason").required=needsReason;$("action-reason").hidden=!needsReason;root.querySelector('label[for="action-reason"]').hidden=!needsReason;$("action-error").textContent="";actionCallback=fn;actionNeedsReason=needsReason;$("action-submit").disabled=false;$("action-dialog").showModal();}
 for(const id of ["dialog-close","dialog-cancel"])bind($(id),"click",()=>$("action-dialog").close());
 bind($("action-form"),"submit",async()=>{const reason=$("action-reason").value.trim();if(actionNeedsReason&&!reason){$("action-error").textContent="请填写理由。";return;}try{$("notice").hidden=true;$("notice").textContent="";await actionCallback(reason);$("action-dialog").close();if($("notice").hidden)notice("操作已完成。");}catch(e){if(e.obsolete)return;$("action-error").textContent=e.message+(e.status===409?" 请关闭窗口、刷新详情后重试。":"");}});
 function reviewAction(r,approve){let checkbox=null;const fields=el("div");fields.append(el("p","影响游戏："+r.affected_games.join("、"),"hint"));if(r.stale){const label=el("label",undefined,"check-row");checkbox=el("input");checkbox.type="checkbox";checkbox.required=true;label.append(checkbox,el("span","我已核对目标变化，确认按当前版本审核。"));fields.append(label);}openAction(approve?"通过此申请":"拒绝此申请",`#${r.id} · ${requestLabel(r)}`,fields,async reason=>{const body={version:r.version,approve,reason};if(r.stale){if(!checkbox.checked)throw new Error("请先确认目标变化。");body.confirmed_target_versions=r.current_target_versions;}await api(`requests/${r.id}/review`,body);$("detail-dialog").close();clear($("review-detail"));const refreshes=[loadRequests("review"),loadRequests("my")];if(state.selectedSongId)refreshes.push(selectSong(state.selectedSongId));refreshAfterWrite(...refreshes);});}
@@ -149,4 +157,7 @@ bind($("relink-search"),"submit",async()=>{const data=await api("search?"+new UR
 function renderRelink(){$("relink-selection").replaceChildren(...[...state.relink.values()].map(s=>{const row=el("div",undefined,"selection-chip");row.append(el("span",s.game_code+" · "+s.title),button("移除",()=>{state.relink.delete(s.id);relinkKey=crypto.randomUUID();renderRelink();},"quiet"));return row;}));}
 let relinkKey=crypto.randomUUID();$("relink-form").addEventListener("input",()=>relinkKey=crypto.randomUUID());
 bind($("relink-form"),"submit",async()=>{const ids=[...state.relink.keys()];const mode=$("relink-mode").value;if(ids.length<(mode==="merge"?2:1))throw new Error(mode==="merge"?"合并至少选择两个收录。":"请至少选择一个收录。");const reason=$("relink-reason").value.trim();if(!reason)throw new Error("请填写调整理由。");const result=await api("requests",{operation:"RELINK_GAME_SONGS",payload:{song_ids:ids,mode},reason,idempotency_key:relinkKey});notice(`已提交请求 #${result.id}，由另一位管理员审核后生效。`);state.relink.clear();renderRelink();$("relink-reason").value="";relinkKey=crypto.randomUUID();refreshAfterWrite(loadRequests("my"));});
-(async()=>{try{await signedIn(await api("me"));}catch(e){if(!e.obsolete&&e.status!==401)notice(e.message,true);}})();
+try{await signedIn(await api("me"));}catch(e){if(!e.obsolete&&e.status!==401)notice(e.message,true);}
+
+};
+if(document.getElementById("alias-root")) window.mountAliasPortal(document.getElementById("alias-root"),window.aliasRelay).catch(()=>{document.getElementById("alias-root").textContent="工作台加载失败，请刷新重试。";});

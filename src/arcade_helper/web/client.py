@@ -30,7 +30,9 @@ class EditorSession:
         self.http = self.ws = self.task = None
         self.closed = False
 
-    async def start(self):
+    async def start(self, *, page_path=None):
+        if page_path is not None and not re.fullmatch(r"/[a-zA-Z0-9_/-]+/", page_path):
+            raise ValueError("Editor entry must be a same-origin absolute page path")
         self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15), trust_env=True)
         try:
             async with self.http.post(self.url + BASE + "/api/channels", headers={"x-relay-token": self.token}) as response:
@@ -53,7 +55,7 @@ class EditorSession:
             if self.closed:
                 raise ValueError("Relay connection closed")
             fragment = urlencode({"channel": self.id, "key": data["browser_key"], "public": public_key(self.private), "secret": self.secret})
-            return self.url + BASE + "/#" + fragment
+            return self.url + (page_path or BASE + "/") + "#" + fragment
         except BaseException:
             await self.close()
             raise

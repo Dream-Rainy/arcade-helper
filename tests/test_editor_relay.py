@@ -90,7 +90,8 @@ async def test_relay_credentials_single_peer_forwarding_and_disconnect_cleanup()
         await bot.close()
 
 
-async def test_outbound_editor_link_authentication_and_tampered_requests():
+@pytest.mark.parametrize("page_path", [None, "/manage/"])
+async def test_outbound_editor_link_authentication_and_tampered_requests(page_path):
     async with relay_server() as (origin, token, app), aiohttp.ClientSession() as http:
         calls, closed = [], asyncio.Event()
         async def dispatch(request):
@@ -98,7 +99,8 @@ async def test_outbound_editor_link_authentication_and_tampered_requests():
             return {"status": 200, "data": {"applied": request["path"]}}
         async def on_close(): closed.set()
         session = EditorSession(origin, token, handler=dispatch, on_close=on_close)
-        url = await session.start()
+        url = await session.start(page_path=page_path)
+        assert urlsplit(url).path == (page_path or BASE + "/")
         assert session.token not in url
         fragment = parse_qs(urlsplit(url).fragment)
         secret = fragment["secret"][0]
